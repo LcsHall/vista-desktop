@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Vista Platform</title>
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <!--
+    Custom title bar. The whole bar except the right-side button
+    cluster is a Tauri drag region (data-tauri-drag-region) so the
+    user can grab anywhere and move the window. Double-clicking the
+    drag region toggles maximize, matching native OS behavior.
+  -->
+  <div class="titlebar" data-tauri-drag-region>
+    <div class="titlebar__brand" data-tauri-drag-region>
+      <!-- Inline SVG so the title bar doesn't need a network round-
+           trip to display. Swap in the real Vista mark when you have
+           a single-color or duotone version that reads at 16px. For
+           now this is a placeholder "V" rosette. -->
+      <svg class="titlebar__logo" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="2" y="2" width="20" height="20" rx="4" fill="#223E91"/>
+        <text x="12" y="17" font-family="Georgia, serif" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">V</text>
+      </svg>
+      <span class="titlebar__title" data-tauri-drag-region>Vista Platform</span>
+    </div>
+
+    <!-- Reserve a flex spacer so the brand stays left + buttons stay
+         right regardless of window width. Drag region too. -->
+    <div class="titlebar__spacer" data-tauri-drag-region></div>
+
+    <!--
+      Window controls. Tauri's drag-region attribute is INHERITED, so
+      we explicitly opt out on each button with class="titlebar__btn"
+      (the CSS sets app-region: no-drag indirectly via pointer events).
+      The actual opt-out is happening because these elements have
+      onclick handlers — Tauri's drag region defers to interactive
+      elements when they receive pointer events.
+
+      Button order matches Windows convention: minimize, maximize,
+      close. On macOS users expect traffic lights on the left — we'll
+      flip the order with a CSS media query when we add Mac support.
+    -->
+    <div class="titlebar__controls">
+      <button class="titlebar__btn" id="btn-min" aria-label="Minimize" title="Minimize">
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+          <line x1="1" y1="5" x2="9" y2="5" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+      </button>
+      <button class="titlebar__btn" id="btn-max" aria-label="Maximize" title="Maximize">
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true" id="icon-max">
+          <rect x="1" y="1" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true" id="icon-restore" style="display:none">
+          <rect x="2" y="3" width="6" height="6" fill="none" stroke="currentColor" stroke-width="1.2"/>
+          <path d="M3 3 V1 H9 V7 H7" fill="none" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+      </button>
+      <button class="titlebar__btn titlebar__btn--close" id="btn-close" aria-label="Close" title="Close">
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+          <line x1="1" y1="1" x2="9" y2="9" stroke="currentColor" stroke-width="1.2"/>
+          <line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

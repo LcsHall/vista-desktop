@@ -1,0 +1,33 @@
+[package]
+name = "vista-platform"
+version = "0.1.0"
+description = "Vista Platform desktop app"
+authors = ["Vista Interface"]
+edition = "2021"
+
+[lib]
+name = "vista_platform_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri core — pick the runtime backend at compile time. tray-icon
+# enables the optional system-tray feature; remove the feature flag
+# if we decide not to ship a tray icon.
+tauri = { version = "2", features = ["tray-icon"] }
+# Updater — polls the GitHub Releases manifest configured in
+# tauri.conf.json and installs signed updates. The signing keypair
+# is generated separately via `npm run tauri signer generate`; the
+# private half lives in CI secrets, the public half goes into
+# tauri.conf.json's plugins.updater.pubkey field.
+tauri-plugin-updater = "2"
+# Serde for any IPC payloads (window state, etc).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# This feature is used for production builds or when a dev server is
+# not specified, DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]

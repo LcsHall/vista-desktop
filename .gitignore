@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Tauri build output
+src-tauri/target/
+src-tauri/gen/
+src-tauri/Cargo.lock
+
+# Build artifacts
+dist/
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Env
+.env
+.env.local
+
+# Secrets — NEVER commit these. The updater private key signs every
+# release; if it leaks, an attacker can push malicious "updates" to
+# your users. Store offline + in a CI secret named TAURI_SIGNING_KEY.
+*.key
+*.pem
+~/.tauri/
+
+# Tauri-generated capability files we want to track are explicit;
+# this catches any accidental local-only ones.
+src-tauri/capabilities/*.local.json

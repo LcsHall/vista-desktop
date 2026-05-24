@@ -1,0 +1,98 @@
+/* Reset only what we need — title bar is the entire page, no other
+   layout to worry about. */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: #FFFFFF;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  /* Disable browser text selection in the title bar — pointer events
+     here are reserved for window drag + button clicks. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.titlebar {
+  height: 40px;
+  display: flex;
+  align-items: center;
+  background: #F7F4EE;            /* Champagne ground from the mobile app palette */
+  border-bottom: 1px solid #E8E1D4;
+  /* The 1px hairline at the bottom doubles as a visual seam between
+     the chrome and the web content below it. */
+}
+
+.titlebar__brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  height: 100%;
+}
+
+.titlebar__logo {
+  flex: 0 0 auto;
+}
+
+.titlebar__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0E1729;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.titlebar__spacer {
+  flex: 1;
+  /* Empty drag region between the brand and the window controls. */
+}
+
+.titlebar__controls {
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+}
+
+.titlebar__btn {
+  width: 46px;                    /* Windows 11 convention */
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: #5b6374;
+  cursor: pointer;
+  outline: none;
+  transition: background-color 80ms ease, color 80ms ease;
+  /* Tauri's data-tauri-drag-region attribute is inherited from the
+     parent .titlebar element, but BUTTONS are click targets and their
+     onclick handlers take precedence over the drag. The button still
+     "owns" its pointer events. */
+}
+
+.titlebar__btn:hover {
+  background: rgba(14, 23, 41, 0.06);
+  color: #0E1729;
+}
+
+.titlebar__btn:active {
+  background: rgba(14, 23, 41, 0.12);
+}
+
+.titlebar__btn--close:hover {
+  background: #E81123;            /* Windows-style red close */
+  color: #FFFFFF;
+}
+
+.titlebar__btn--close:active {
+  background: #F1707A;
+}
+
+/* Focus outlines: visible for keyboard nav, suppressed for mouse.
+   :focus-visible is the right primitive for this. */
+.titlebar__btn:focus-visible {
+  outline: 2px solid #223E91;
+  outline-offset: -3px;
+}
