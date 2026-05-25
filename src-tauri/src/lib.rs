@@ -1,112 +1,130 @@
 // Vista Platform — Tauri shell.
 //
-// Architecture: one borderless window with TWO child webviews stacked
-// vertically:
-//   ┌────────────────────────────────┐
-//   │ title bar (local index.html)   │  40 px tall, draggable
-//   ├────────────────────────────────┤
-//   │ content (app.vistainterface)   │  fills the rest
-//   │                                │
-//   └────────────────────────────────┘
+// Architecture: one borderless, maximized window with a custom title bar
+// webview on top and N "content" webviews below it — one per open TAB.
+// Only the active tab's webview is shown; the rest are hidden (their
+// pages stay loaded, so switching is instant and preserves state).
 //
-// The title bar lives in this repo (HTML/CSS in /src) so the desktop
-// shell stays self-contained. The content webview points at the live
-// production app, so any web change ships instantly via Vercel — no
-// EAS-style rebuild for content tweaks. The shell itself only needs
-// updates when we change native features (tray, menus, icons,
-// auto-updater plumbing).
+//   ┌─────────────────────────────────────────────┐
+//   │ ⛵ │ Platform │ POS ✕ │ Messaging ✕ │ – ☐ ✕ │  title bar (40px)
+//   ├─────────────────────────────────────────────┤
+//   │                                               │
+//   │   active tab's content webview fills here     │
+//   │                                               │
+//   └─────────────────────────────────────────────┘
 //
-// Why multi-webview instead of iframe? An iframe would be subject to
-// X-Frame-Options / CSP frame-ancestors restrictions, and Supabase
-// auth popups (OAuth providers, etc.) would be awkward. Multi-webview
-// gives the content a top-level browsing context — same as a real
-// browser window — so auth flows + cookies + websockets all work
-// exactly as they do at https://app.vistainterface.com in Chrome.
+// The title bar lives in this repo (HTML/CSS/JS in /src). The first tab
+// ("Platform", label `content`) loads the live production app. Opening
+// POS / Messaging / any /manage/* page from the web app spawns a new tab
+// instead of a browser window or OS window; genuinely external links
+// (the public booking site, the VISTA Consulting handoff to Interface)
+// still open in the system browser.
+//
+// Why multi-webview instead of an iframe? An iframe is subject to
+// X-Frame-Options / CSP frame-ancestors and would break Supabase auth
+// popups. Each webview is a top-level browsing context — same as a real
+// browser tab — so auth, cookies, and websockets all work normally. All
+// tabs share the app's single WebView2 profile, so the signed-in session
+// cookie is shared across them (no re-login per tab).
 
-// `Manager` brings the `get_webview` / webview-lookup methods into scope
-// (trait methods, unstable-gated alongside the multi-webview API).
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+// `Manager` brings get_webview / get_window / state / manage into scope;
+// `Emitter` brings emit (title-bar notifications). Both, plus the
+// multi-webview API (WindowBuilder / WebviewBuilder / Window::add_child /
+// get_webview), are unstable-gated — keep `features=["unstable"]`.
 use tauri::webview::NewWindowResponse;
 use tauri::{
-    LogicalPosition, LogicalSize, Manager, PhysicalSize, WebviewBuilder, WebviewUrl, WindowBuilder,
-    WindowEvent,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalSize, Url, WebviewBuilder,
+    WebviewUrl, WindowBuilder, WindowEvent,
 };
 
-// Production URL the content webview loads. MUST be the Platform host,
-// not app.vistainterface.com.
+// Production URL the first (Platform) tab loads. MUST be the Platform
+// host, not app.vistainterface.com.
 //
 // Login lives on Interface (app.vistainterface.com/login). When an
 // unauthenticated user hits platform.vistainterface.com, Platform's
 // proxy sets a `vista_postlogin_target` cookie on `.vistainterface.com`
-// and *then* redirects to the Interface login. The Interface login
-// reads that cookie after a successful sign-in and hands the session
-// back to Platform (cross-subdomain handoff). Loading
-// app.vistainterface.com directly skips the cookie-setting redirect, so
-// login has no post-login target and dumps the user on Interface
-// instead of Platform. The extra redirect hop is load-bearing — do not
-// "optimize" it away. (Cookies on `.vistainterface.com` are shared
-// across both subdomains within the WebView2 profile, so the handoff
-// works exactly as it does in a desktop browser.)
+// and *then* redirects to the Interface login. The Interface login reads
+// that cookie after a successful sign-in and hands the session back to
+// Platform (cross-subdomain handoff). Loading app.vistainterface.com
+// directly skips the cookie-setting redirect, so login has no post-login
+// target and dumps the user on Interface instead of Platform. The extra
+// redirect hop is load-bearing — do not "optimize" it away.
 const PRODUCTION_URL: &str = "https://platform.vistainterface.com";
 
-// Height of the custom title bar in logical pixels. Matches modern
-// Windows app conventions (Edge, Teams, Notion all sit around 32-40).
+// Host of the Platform app. Used to tell "internal staff page" (open as
+// a new tab) apart from "external link" (open in the system browser).
+const PLATFORM_HOST: &str = "platform.vistainterface.com";
+
+// Label of the first, non-closeable tab (the live Platform app).
+const PLATFORM_TAB: &str = "content";
+
+// Height of the custom title bar in logical pixels.
 const TITLE_BAR_HEIGHT: f64 = 40.0;
 
-// Initial window size. Picked to comfortably fit the vista-platform
-// layout's max-width content areas + sidebar. User can resize freely.
+// Initial restore-down window size (the window opens maximized).
 const INITIAL_WIDTH: f64 = 1280.0;
 const INITIAL_HEIGHT: f64 = 800.0;
+
+// Monotonic counter for unique tab webview labels.
+static TAB_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+// window.close() in a browser only closes a window that was opened by
+// script. Tab webviews are opened natively by Rust, so a page's "✕ Close"
+// button (which calls window.close()) is ignored by the engine and the
+// document just goes blank. We bridge it: an injected script reroutes
+// window.close() to a sentinel navigation, which the tab's on_navigation
+// handler catches and turns into a real tab close. `.invalid` is a
+// reserved TLD (RFC 6761) that never resolves, so it can't hit a server.
+const CLOSE_SENTINEL: &str = "https://vista-desktop.invalid/__close__";
+const CLOSE_BRIDGE_SCRIPT: &str = r#"(function () {
+  window.close = function () {
+    window.location.href = 'https://vista-desktop.invalid/__close__';
+  };
+})();"#;
+
+// Ordered list of open tabs (by webview label) + which one is showing.
+// order[0] is always PLATFORM_TAB. Stored as managed Tauri state.
+struct TabState {
+    order: Vec<String>,
+    active: String,
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         // Updater plugin: configured in tauri.conf.json. Polls the
-        // GitHub Releases manifest on launch + offers any newer
-        // signed build via a confirmation dialog.
+        // GitHub Releases manifest on launch + offers any newer signed
+        // build via a confirmation dialog.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let window = WindowBuilder::new(app, "main")
                 .title("Vista Platform")
                 .inner_size(INITIAL_WIDTH, INITIAL_HEIGHT)
                 .min_inner_size(900.0, 600.0)
-                // decorations(false) = no native title bar / no
-                // Windows chrome. We draw our own (see /src/index.html).
+                // decorations(false) = no native chrome; we draw our own.
                 .decorations(false)
-                // Center on first launch. After that, Tauri restores
-                // the last position via the optional window-state
-                // plugin if we add one later.
+                // Open maximized; inner_size is the restore-down size.
+                .maximized(true)
                 .center()
                 .build()?;
 
-            // Title bar webview — loads /src/index.html. WebviewUrl::App
-            // resolves to the frontendDist directory configured in
-            // tauri.conf.json.
+            // Title bar webview — loads /src/index.html.
             window.add_child(
                 WebviewBuilder::new("title_bar", WebviewUrl::App("index.html".into())),
                 LogicalPosition::new(0.0, 0.0),
                 LogicalSize::new(INITIAL_WIDTH, TITLE_BAR_HEIGHT),
             )?;
 
-            // Content webview — loads the live production app.
-            // Positioned just below the title bar; resize handler
-            // below keeps it sized to the window.
-            let prod_url = PRODUCTION_URL
+            // First tab: the live production app.
+            let prod_url: Url = PRODUCTION_URL
                 .parse()
                 .expect("PRODUCTION_URL must be a valid URL");
-            let content = WebviewBuilder::new("content", WebviewUrl::External(prod_url))
-                // A desktop window has no browser tabs, so any
-                // target="_blank" / window.open request (the sidebar's
-                // "View Booking Site" + "VISTA Consulting" links, plus
-                // any other external link in the web app) would otherwise
-                // try to spawn a chromeless child window. Instead, hand
-                // the URL to the OS default browser and deny the in-app
-                // window. Note: this also intercepts any window.open the
-                // app uses for OAuth popups — fine today since sign-in is
-                // email/password; revisit if a provider popup is added.
-                .on_new_window(|url, _features| {
-                    if let Err(e) = open::that_detached(url.as_str()) {
-                        eprintln!("[vista-desktop] failed to open {url} in browser: {e}");
-                    }
+            let nw_app = app.handle().clone();
+            let content = WebviewBuilder::new(PLATFORM_TAB, WebviewUrl::External(prod_url))
+                .on_new_window(move |url, _features| {
+                    route_new_window(&nw_app, url);
                     NewWindowResponse::Deny
                 });
             window.add_child(
@@ -115,62 +133,241 @@ pub fn run() {
                 LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT - TITLE_BAR_HEIGHT),
             )?;
 
-            // Resize handler: when the window changes size, resize
-            // the content webview so it fills the area below the
-            // title bar. Title bar stays at its 40px height + full
-            // width.
-            let window_handle = window.clone();
+            // Seed tab state with the Platform tab active.
+            app.manage(Mutex::new(TabState {
+                order: vec![PLATFORM_TAB.to_string()],
+                active: PLATFORM_TAB.to_string(),
+            }));
+
+            // Keep the title bar + the active tab sized to the window.
+            let resize_app = app.handle().clone();
             window.on_window_event(move |event| {
                 if let WindowEvent::Resized(_) = event {
-                    if let Err(e) = resize_webviews(&window_handle) {
-                        eprintln!("[vista-desktop] resize failed: {e}");
-                    }
+                    relayout(&resize_app);
                 }
             });
-
-            // First resize after the window is fully on-screen — the
-            // initial size set in WindowBuilder is sometimes adjusted
-            // by the OS before the webviews attach, leaving the
-            // content area slightly off. Force one resize now to
-            // line everything up.
-            resize_webviews(&window)?;
+            // Initial layout once the window is on-screen (the OS may
+            // adjust the size before the webviews attach).
+            relayout(app.handle());
 
             Ok(())
         })
-        // IPC commands invoked from the title bar HTML to control the
-        // window. See /src/main.ts for the JS side.
+        // IPC commands invoked from the title bar (see /src/main.js).
         .invoke_handler(tauri::generate_handler![
             window_minimize,
             window_toggle_maximize,
             window_close,
             window_is_maximized,
+            switch_tab,
+            close_tab,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
-/// Resize the two child webviews to match the current window size.
-/// Title bar stays its fixed height; content fills the rest.
-fn resize_webviews(window: &tauri::Window) -> tauri::Result<()> {
-    let size: PhysicalSize<u32> = window.inner_size()?;
-    let scale = window.scale_factor()?;
-    let logical_width = (size.width as f64) / scale;
-    let logical_height = (size.height as f64) / scale;
-    let content_height = (logical_height - TITLE_BAR_HEIGHT).max(0.0);
+// ─── Tab management ─────────────────────────────────────────────────
 
-    if let Some(title_bar) = window.get_webview("title_bar") {
-        title_bar.set_size(LogicalSize::new(logical_width, TITLE_BAR_HEIGHT))?;
+/// Decide where a new-window request (target="_blank" / window.open)
+/// goes: an internal /manage/* page on the Platform host opens as a new
+/// tab; everything else opens in the system browser. Window/webview
+/// mutations are deferred to the main thread to avoid reentrancy while
+/// the webview engine is mid new-window-request.
+fn route_new_window(app: &AppHandle, url: Url) {
+    let is_internal_page =
+        url.host_str() == Some(PLATFORM_HOST) && url.path().starts_with("/manage/");
+    if is_internal_page {
+        let app = app.clone();
+        let _ = app.clone().run_on_main_thread(move || open_tab(&app, url));
+    } else if let Err(e) = open::that_detached(url.as_str()) {
+        eprintln!("[vista-desktop] failed to open {url} in browser: {e}");
     }
-    if let Some(content) = window.get_webview("content") {
-        content.set_position(LogicalPosition::new(0.0, TITLE_BAR_HEIGHT))?;
-        content.set_size(LogicalSize::new(logical_width, content_height))?;
-    }
-    Ok(())
 }
 
-// ─── Window control IPC commands ────────────────────────────────────
-// These are invoked by the title bar HTML's min/max/close buttons via
-// the Tauri JS API: `window.__TAURI__.core.invoke('window_minimize')`.
+/// Add a new content webview as a tab, make it active, and tell the
+/// title bar to render it. Runs on the main thread.
+fn open_tab(app: &AppHandle, url: Url) {
+    let window = match app.get_window("main") {
+        Some(w) => w,
+        None => return,
+    };
+    let label = format!("tab-{}", TAB_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let (lw, lh) = logical_inner(&window).unwrap_or((INITIAL_WIDTH, INITIAL_HEIGHT));
+    let content_h = (lh - TITLE_BAR_HEIGHT).max(0.0);
+
+    let nw_app = app.clone();
+    let nav_app = app.clone();
+    let nav_label = label.clone();
+    let builder = WebviewBuilder::new(label.as_str(), WebviewUrl::External(url.clone()))
+        // Tabs can themselves open further tabs / external links.
+        .on_new_window(move |u, _features| {
+            route_new_window(&nw_app, u);
+            NewWindowResponse::Deny
+        })
+        // window.close() → sentinel nav → close this tab.
+        .initialization_script(CLOSE_BRIDGE_SCRIPT)
+        .on_navigation(move |nav_url| {
+            if nav_url.as_str().starts_with(CLOSE_SENTINEL) {
+                let a = nav_app.clone();
+                let l = nav_label.clone();
+                let _ = nav_app.run_on_main_thread(move || close_tab_impl(&a, &l));
+                return false; // cancel the sentinel nav; the tab is closing
+            }
+            true
+        });
+
+    if let Err(e) = window.add_child(
+        builder,
+        LogicalPosition::new(0.0, TITLE_BAR_HEIGHT),
+        LogicalSize::new(lw, content_h),
+    ) {
+        eprintln!("[vista-desktop] failed to open tab for {url}: {e}");
+        return;
+    }
+
+    {
+        let state = app.state::<Mutex<TabState>>();
+        let mut s = state.lock().unwrap();
+        s.order.push(label.clone());
+    }
+    // Show the new tab, hide the rest, mark it active.
+    activate(app, &label);
+
+    let _ = app.emit(
+        "tab:opened",
+        serde_json::json!({ "label": label, "title": tab_title(&url) }),
+    );
+}
+
+/// Show `label`'s webview at the content rect, hide every other tab, and
+/// record it as active. Runs on the main thread.
+fn activate(app: &AppHandle, label: &str) {
+    let window = match app.get_window("main") {
+        Some(w) => w,
+        None => return,
+    };
+    let (lw, lh) = match logical_inner(&window) {
+        Some(v) => v,
+        None => return,
+    };
+    let content_h = (lh - TITLE_BAR_HEIGHT).max(0.0);
+    let order = { app.state::<Mutex<TabState>>().lock().unwrap().order.clone() };
+    for l in &order {
+        if let Some(wv) = app.get_webview(l) {
+            if l == label {
+                let _ = wv.set_position(LogicalPosition::new(0.0, TITLE_BAR_HEIGHT));
+                let _ = wv.set_size(LogicalSize::new(lw, content_h));
+                let _ = wv.show();
+            } else {
+                let _ = wv.hide();
+            }
+        }
+    }
+    app.state::<Mutex<TabState>>().lock().unwrap().active = label.to_string();
+}
+
+/// Close a tab: drop its webview, re-activate a neighbor if it was the
+/// active tab, and tell the title bar. The Platform tab can't be closed.
+/// Runs on the main thread.
+fn close_tab_impl(app: &AppHandle, label: &str) {
+    if label == PLATFORM_TAB {
+        return;
+    }
+    let reactivate = {
+        let state = app.state::<Mutex<TabState>>();
+        let mut s = state.lock().unwrap();
+        if let Some(idx) = s.order.iter().position(|l| l == label) {
+            s.order.remove(idx);
+        }
+        if s.active == label {
+            // Fall back to the last remaining tab (or Platform).
+            Some(
+                s.order
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| PLATFORM_TAB.to_string()),
+            )
+        } else {
+            None
+        }
+    };
+    if let Some(wv) = app.get_webview(label) {
+        let _ = wv.close();
+    }
+    if let Some(next) = &reactivate {
+        activate(app, next);
+    }
+    let active_now = app.state::<Mutex<TabState>>().lock().unwrap().active.clone();
+    let _ = app.emit(
+        "tab:closed",
+        serde_json::json!({ "label": label, "active": active_now }),
+    );
+}
+
+/// Human label for a tab from its URL's last path segment.
+fn tab_title(url: &Url) -> String {
+    let seg = url
+        .path()
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("Page");
+    match seg {
+        "pos" => "POS".to_string(),
+        "messaging" => "Messaging".to_string(),
+        "marketing" => "Marketing".to_string(),
+        "waitlist" => "Waitlist".to_string(),
+        "schedule" => "Schedule".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Page".to_string(),
+            }
+        }
+    }
+}
+
+/// Title bar + active tab follow the window size.
+fn relayout(app: &AppHandle) {
+    let window = match app.get_window("main") {
+        Some(w) => w,
+        None => return,
+    };
+    let (lw, lh) = match logical_inner(&window) {
+        Some(v) => v,
+        None => return,
+    };
+    let content_h = (lh - TITLE_BAR_HEIGHT).max(0.0);
+    if let Some(title_bar) = app.get_webview("title_bar") {
+        let _ = title_bar.set_size(LogicalSize::new(lw, TITLE_BAR_HEIGHT));
+    }
+    let active = app.state::<Mutex<TabState>>().lock().unwrap().active.clone();
+    if let Some(content) = app.get_webview(&active) {
+        let _ = content.set_position(LogicalPosition::new(0.0, TITLE_BAR_HEIGHT));
+        let _ = content.set_size(LogicalSize::new(lw, content_h));
+    }
+}
+
+/// Window inner size in logical pixels.
+fn logical_inner(window: &tauri::Window) -> Option<(f64, f64)> {
+    let size: PhysicalSize<u32> = window.inner_size().ok()?;
+    let scale = window.scale_factor().ok()?;
+    Some(((size.width as f64) / scale, (size.height as f64) / scale))
+}
+
+// ─── IPC commands ───────────────────────────────────────────────────
+// Invoked from the title bar via window.__TAURI__.core.invoke(...).
+
+#[tauri::command]
+fn switch_tab(app: AppHandle, label: String) {
+    let _ = app.clone().run_on_main_thread(move || activate(&app, &label));
+}
+
+#[tauri::command]
+fn close_tab(app: AppHandle, label: String) {
+    let _ = app
+        .clone()
+        .run_on_main_thread(move || close_tab_impl(&app, &label));
+}
 
 #[tauri::command]
 fn window_minimize(window: tauri::Window) -> tauri::Result<()> {

@@ -7,38 +7,28 @@
 </head>
 <body>
   <!--
-    Custom title bar. The whole bar except the right-side button
-    cluster is a Tauri drag region (data-tauri-drag-region) so the
-    user can grab anywhere and move the window. Double-clicking the
-    drag region toggles maximize, matching native OS behavior.
+    Custom title bar. The brand area + the flexible spacer are Tauri drag
+    regions (data-tauri-drag-region) so the user can grab them to move the
+    window. The tab strip and the window-control buttons are interactive
+    and deliberately are NOT drag regions.
   -->
   <div class="titlebar" data-tauri-drag-region>
     <div class="titlebar__brand" data-tauri-drag-region>
-      <!-- Real Vista sail mark. Served locally from frontendDist (this
-           src/ dir) so the title bar needs no network round-trip — it
-           renders instantly even before the content webview connects.
-           35x40 source asset, displayed at 20px tall (width auto-scales
-           to preserve the mark's aspect). Generated from the Vista
-           brand mark with the "VISTA Interface" wordmark trimmed off. -->
+      <!-- Real Vista sail mark, served locally from this src/ dir. -->
       <img class="titlebar__logo" src="./logo.png" alt="Vista" draggable="false" />
-      <span class="titlebar__title" data-tauri-drag-region>Vista Platform</span>
     </div>
 
-    <!-- Reserve a flex spacer so the brand stays left + buttons stay
-         right regardless of window width. Drag region too. -->
+    <!-- Tab strip. Populated by main.js: a fixed "Platform" tab plus one
+         tab per opened /manage/* page (POS, Messaging, …). -->
+    <div class="titlebar__tabs" id="tabs"></div>
+
+    <!-- Flexible drag region between the tabs and the window controls. -->
     <div class="titlebar__spacer" data-tauri-drag-region></div>
 
     <!--
-      Window controls. Tauri's drag-region attribute is INHERITED, so
-      we explicitly opt out on each button with class="titlebar__btn"
-      (the CSS sets app-region: no-drag indirectly via pointer events).
-      The actual opt-out is happening because these elements have
-      onclick handlers — Tauri's drag region defers to interactive
-      elements when they receive pointer events.
-
-      Button order matches Windows convention: minimize, maximize,
-      close. On macOS users expect traffic lights on the left — we'll
-      flip the order with a CSS media query when we add Mac support.
+      Window controls. Order matches Windows convention: minimize,
+      maximize, close. These are click targets (no drag-region attribute),
+      so Tauri lets their click handlers run instead of starting a drag.
     -->
     <div class="titlebar__controls">
       <button class="titlebar__btn" id="btn-min" aria-label="Minimize" title="Minimize">
