@@ -25,15 +25,28 @@
 
 // `Manager` brings the `get_webview` / webview-lookup methods into scope
 // (trait methods, unstable-gated alongside the multi-webview API).
+use tauri::webview::NewWindowResponse;
 use tauri::{
     LogicalPosition, LogicalSize, Manager, PhysicalSize, WebviewBuilder, WebviewUrl, WindowBuilder,
     WindowEvent,
 };
 
-// Production URL the content webview loads. `platform.vistainterface.com`
-// 307s to `app.vistainterface.com/login`; point directly to skip the
-// extra round trip on every launch.
-const PRODUCTION_URL: &str = "https://app.vistainterface.com";
+// Production URL the content webview loads. MUST be the Platform host,
+// not app.vistainterface.com.
+//
+// Login lives on Interface (app.vistainterface.com/login). When an
+// unauthenticated user hits platform.vistainterface.com, Platform's
+// proxy sets a `vista_postlogin_target` cookie on `.vistainterface.com`
+// and *then* redirects to the Interface login. The Interface login
+// reads that cookie after a successful sign-in and hands the session
+// back to Platform (cross-subdomain handoff). Loading
+// app.vistainterface.com directly skips the cookie-setting redirect, so
+// login has no post-login target and dumps the user on Interface
+// instead of Platform. The extra redirect hop is load-bearing — do not
+// "optimize" it away. (Cookies on `.vistainterface.com` are shared
+// across both subdomains within the WebView2 profile, so the handoff
+// works exactly as it does in a desktop browser.)
+const PRODUCTION_URL: &str = "https://platform.vistainterface.com";
 
 // Height of the custom title bar in logical pixels. Matches modern
 // Windows app conventions (Edge, Teams, Notion all sit around 32-40).
@@ -80,8 +93,24 @@ pub fn run() {
             let prod_url = PRODUCTION_URL
                 .parse()
                 .expect("PRODUCTION_URL must be a valid URL");
+            let content = WebviewBuilder::new("content", WebviewUrl::External(prod_url))
+                // A desktop window has no browser tabs, so any
+                // target="_blank" / window.open request (the sidebar's
+                // "View Booking Site" + "VISTA Consulting" links, plus
+                // any other external link in the web app) would otherwise
+                // try to spawn a chromeless child window. Instead, hand
+                // the URL to the OS default browser and deny the in-app
+                // window. Note: this also intercepts any window.open the
+                // app uses for OAuth popups — fine today since sign-in is
+                // email/password; revisit if a provider popup is added.
+                .on_new_window(|url, _features| {
+                    if let Err(e) = open::that_detached(url.as_str()) {
+                        eprintln!("[vista-desktop] failed to open {url} in browser: {e}");
+                    }
+                    NewWindowResponse::Deny
+                });
             window.add_child(
-                WebviewBuilder::new("content", WebviewUrl::External(prod_url)),
+                content,
                 LogicalPosition::new(0.0, TITLE_BAR_HEIGHT),
                 LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT - TITLE_BAR_HEIGHT),
             )?;

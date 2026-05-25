@@ -29,6 +29,12 @@ tauri-plugin-updater = "2"
 # Serde for any IPC payloads (window state, etc).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Opens URLs in the user's default browser. Used by the content
+# webview's new-window handler so target="_blank" / window.open links
+# (the sidebar's "View Booking Site" + "VISTA Consulting", etc.) leave
+# the chromeless app and open in a real browser instead. Called purely
+# from Rust, so it needs no Tauri capability/permission grant.
+open = "5"
 
 [features]
 # This feature is used for production builds or when a dev server is
