@@ -1,6 +1,6 @@
 [package]
 name = "vista-platform"
-version = "0.1.1"
+version = "0.1.2"
 description = "Vista Platform desktop app"
 authors = ["Vista Interface"]
 edition = "2021"

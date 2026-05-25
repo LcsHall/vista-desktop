@@ -84,6 +84,13 @@ const CLOSE_BRIDGE_SCRIPT: &str = r#"(function () {
   };
 })();"#;
 
+/// Marks the page as running inside the desktop app. The web app reads
+/// `window.__VISTA_DESKTOP__` to suppress its "install the desktop app"
+/// prompt. Injected at document start into every content/tab webview.
+fn desktop_marker_script() -> String {
+    format!("window.__VISTA_DESKTOP__ = '{}';", env!("CARGO_PKG_VERSION"))
+}
+
 // Ordered list of open tabs (by webview label) + which one is showing.
 // order[0] is always PLATFORM_TAB. Stored as managed Tauri state.
 struct TabState {
@@ -123,6 +130,7 @@ pub fn run() {
                 .expect("PRODUCTION_URL must be a valid URL");
             let nw_app = app.handle().clone();
             let content = WebviewBuilder::new(PLATFORM_TAB, WebviewUrl::External(prod_url))
+                .initialization_script(desktop_marker_script())
                 .on_new_window(move |url, _features| {
                     route_new_window(&nw_app, url);
                     NewWindowResponse::Deny
@@ -203,8 +211,8 @@ fn open_tab(app: &AppHandle, url: Url) {
             route_new_window(&nw_app, u);
             NewWindowResponse::Deny
         })
-        // window.close() → sentinel nav → close this tab.
-        .initialization_script(CLOSE_BRIDGE_SCRIPT)
+        // Mark the desktop app, then bridge window.close() → sentinel nav.
+        .initialization_script(format!("{}{}", desktop_marker_script(), CLOSE_BRIDGE_SCRIPT))
         .on_navigation(move |nav_url| {
             if nav_url.as_str().starts_with(CLOSE_SENTINEL) {
                 let a = nav_app.clone();
