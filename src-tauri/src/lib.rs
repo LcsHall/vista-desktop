@@ -23,9 +23,11 @@
 // browser window — so auth flows + cookies + websockets all work
 // exactly as they do at https://app.vistainterface.com in Chrome.
 
+// `Manager` brings the `get_webview` / webview-lookup methods into scope
+// (trait methods, unstable-gated alongside the multi-webview API).
 use tauri::{
-    LogicalPosition, LogicalSize, Manager, PhysicalSize, WebviewBuilder, WebviewUrl,
-    WindowBuilder, WindowEvent,
+    LogicalPosition, LogicalSize, Manager, PhysicalSize, WebviewBuilder, WebviewUrl, WindowBuilder,
+    WindowEvent,
 };
 
 // Production URL the content webview loads. `platform.vistainterface.com`

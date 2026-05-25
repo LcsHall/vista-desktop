@@ -11,6 +11,10 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Local dev/build run logs (transient, from `tauri dev` / cargo check)
+devrun*.log
+src-tauri/*.log
+
 # Editor
 .vscode/
 .idea/

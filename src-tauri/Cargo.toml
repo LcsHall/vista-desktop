@@ -15,8 +15,11 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # Tauri core — pick the runtime backend at compile time. tray-icon
 # enables the optional system-tray feature; remove the feature flag
-# if we decide not to ship a tray icon.
-tauri = { version = "2", features = ["tray-icon"] }
+# if we decide not to ship a tray icon. `unstable` exposes the
+# multi-webview API (WindowBuilder + WebviewBuilder + Window::add_child
+# / get_webview) that this shell's title-bar + content split relies on;
+# it is NOT in the stable single-webview (WebviewWindow) surface.
+tauri = { version = "2", features = ["tray-icon", "unstable"] }
 # Updater — polls the GitHub Releases manifest configured in
 # tauri.conf.json and installs signed updates. The signing keypair
 # is generated separately via `npm run tauri signer generate`; the

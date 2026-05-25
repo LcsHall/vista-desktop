@@ -14,14 +14,13 @@
   -->
   <div class="titlebar" data-tauri-drag-region>
     <div class="titlebar__brand" data-tauri-drag-region>
-      <!-- Inline SVG so the title bar doesn't need a network round-
-           trip to display. Swap in the real Vista mark when you have
-           a single-color or duotone version that reads at 16px. For
-           now this is a placeholder "V" rosette. -->
-      <svg class="titlebar__logo" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="2" y="2" width="20" height="20" rx="4" fill="#223E91"/>
-        <text x="12" y="17" font-family="Georgia, serif" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">V</text>
-      </svg>
+      <!-- Real Vista sail mark. Served locally from frontendDist (this
+           src/ dir) so the title bar needs no network round-trip — it
+           renders instantly even before the content webview connects.
+           35x40 source asset, displayed at 20px tall (width auto-scales
+           to preserve the mark's aspect). Generated from the Vista
+           brand mark with the "VISTA Interface" wordmark trimmed off. -->
+      <img class="titlebar__logo" src="./logo.png" alt="Vista" draggable="false" />
       <span class="titlebar__title" data-tauri-drag-region>Vista Platform</span>
     </div>
 

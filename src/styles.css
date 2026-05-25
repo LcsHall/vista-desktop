@@ -33,6 +33,10 @@ html, body {
 
 .titlebar__logo {
   flex: 0 0 auto;
+  height: 20px;
+  width: auto;             /* preserve the sail mark's aspect ratio */
+  display: block;
+  -webkit-user-drag: none; /* don't let the logo start an image-drag */
 }
 
 .titlebar__title {
