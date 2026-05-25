@@ -1,8 +1,8 @@
 {
   "name": "vista-desktop",
   "private": true,
-  "version": "0.1.0",
-  "description": "Vista Platform desktop app — Tauri shell that hosts app.vistainterface.com",
+  "version": "0.1.1",
+  "description": "Vista Platform desktop app — Tauri shell that hosts platform.vistainterface.com",
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
