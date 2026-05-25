@@ -25,12 +25,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: 'macos-latest'
-            target: 'aarch64-apple-darwin,x86_64-apple-darwin'
-            label: 'macOS (Intel + Apple Silicon)'
           - platform: 'windows-latest'
             target: ''
             label: 'Windows'
+          # macOS is disabled until Apple Developer signing/notarization
+          # is set up — without a cert the build fails every release.
+          # Re-enable by uncommenting + adding the signing secrets.
+          # - platform: 'macos-latest'
+          #   target: 'aarch64-apple-darwin,x86_64-apple-darwin'
+          #   label: 'macOS (Intel + Apple Silicon)'
           # Linux later if needed:
           # - platform: 'ubuntu-22.04'
           #   target: ''
