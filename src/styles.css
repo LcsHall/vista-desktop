@@ -4,7 +4,7 @@
 html, body {
   height: 100%;
   overflow: hidden;
-  background: #FFFFFF;
+  background: #0f1828;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   /* Title-bar pointer events are reserved for drag + clicks. */
   user-select: none;
@@ -15,8 +15,8 @@ html, body {
   height: 40px;
   display: flex;
   align-items: center;
-  background: #F7F4EE;            /* Champagne ground from the mobile app palette */
-  border-bottom: 1px solid #E8E1D4;
+  background: #0f1828;            /* Match the Platform sidebar (Modern theme --vp-sidebar-bg) */
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .titlebar__brand {
@@ -33,6 +33,7 @@ html, body {
   width: auto;             /* preserve the sail mark's aspect ratio */
   display: block;
   -webkit-user-drag: none;
+  filter: brightness(0) invert(1);   /* render the dark sail mark white on the navy bar */
 }
 
 /* ── Tab strip ─────────────────────────────────────────────────────── */
@@ -58,7 +59,7 @@ html, body {
   border: none;
   border-radius: 7px;
   background: transparent;
-  color: #5b6374;
+  color: rgba(255, 255, 255, 0.65);
   font-size: 12.5px;
   font-weight: 500;
   letter-spacing: -0.01em;
@@ -69,17 +70,17 @@ html, body {
 }
 
 .titlebar__tab:hover {
-  background: rgba(14, 23, 41, 0.05);
-  color: #0E1729;
+  background: rgba(255, 255, 255, 0.06);
+  color: #ffffff;
 }
 
 /* Active tab: white "card" with a thin green accent underline, echoing
    the platform sidebar's active treatment. */
 .titlebar__tab--active {
-  background: #FFFFFF;
-  color: #0E1729;
+  background: rgba(255, 255, 255, 0.10);
+  color: #ffffff;
   font-weight: 600;
-  box-shadow: 0 1px 2px rgba(14, 23, 41, 0.08), inset 0 -2px 0 #2E7D5B;
+  box-shadow: inset 0 -2px 0 #2E7D5B;   /* green accent underline, echoing the sidebar's active item */
 }
 
 /* Pages with no ✕ (the Platform tab) shouldn't reserve the close slot. */
@@ -108,7 +109,7 @@ html, body {
 }
 
 .titlebar__tab-close:hover {
-  background: rgba(14, 23, 41, 0.12);
+  background: rgba(255, 255, 255, 0.15);
   opacity: 1;
 }
 
@@ -135,19 +136,19 @@ html, body {
   justify-content: center;
   background: transparent;
   border: none;
-  color: #5b6374;
+  color: rgba(255, 255, 255, 0.65);
   cursor: pointer;
   outline: none;
   transition: background-color 80ms ease, color 80ms ease;
 }
 
 .titlebar__btn:hover {
-  background: rgba(14, 23, 41, 0.06);
-  color: #0E1729;
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
 }
 
 .titlebar__btn:active {
-  background: rgba(14, 23, 41, 0.12);
+  background: rgba(255, 255, 255, 0.14);
 }
 
 .titlebar__btn--close:hover {
