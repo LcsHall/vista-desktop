@@ -59,6 +59,10 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
+      - name: Verify tag matches versions (fail fast, before the slow build)
+        shell: bash
+        run: node scripts/check-versions.mjs "$GITHUB_REF_NAME"
+
       - name: npm install
         run: npm install
 

@@ -101,10 +101,14 @@ struct TabState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // Updater plugin: configured in tauri.conf.json. Polls the
-        // GitHub Releases manifest on launch + offers any newer signed
-        // build via a confirmation dialog.
+        // Updater plugin: endpoint + pubkey configured in tauri.conf.json.
+        // Registration alone does NOTHING in Tauri 2 — the launch check
+        // lives in spawn_update_check() below. (The old `"dialog": true`
+        // config was a v1 relic the v2 plugin silently ignored; every
+        // 0.1.0-0.1.3 install shipped with a dormant updater because of
+        // it and needs one manual reinstall to pick up this fix.)
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let window = WindowBuilder::new(app, "main")
                 .title("Vista Platform")
@@ -158,6 +162,10 @@ pub fn run() {
             // adjust the size before the webviews attach).
             relayout(app.handle());
 
+            // Non-blocking startup update check (silent when offline or
+            // already current). Without this the updater never runs.
+            spawn_update_check(app.handle());
+
             Ok(())
         })
         // IPC commands invoked from the title bar (see /src/main.js).
@@ -171,6 +179,46 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ─── Auto-update ────────────────────────────────────────────────────────
+
+/// Check the GitHub Releases feed once at startup; on a newer signed build,
+/// offer Install/Later. Install downloads, applies, and restarts. Failure
+/// paths are deliberately silent — offline launches and 404s (no release
+/// yet) must never bother a medspa mid-checkin. Same pattern as the
+/// vista-admin cockpit, where it's verified end to end.
+fn spawn_update_check(app: &tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+    use tauri_plugin_updater::UpdaterExt;
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Ok(updater) = handle.updater() else { return };
+        let Ok(Some(update)) = updater.check().await else { return };
+        let version = update.version.clone();
+        let restart_handle = handle.clone();
+        handle
+            .dialog()
+            .message(format!(
+                "Vista Platform {version} is available. Install and restart now?"
+            ))
+            .title("Update available")
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Install".into(),
+                "Later".into(),
+            ))
+            .show(move |confirmed| {
+                if !confirmed {
+                    return;
+                }
+                tauri::async_runtime::spawn(async move {
+                    if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
+                        restart_handle.restart();
+                    }
+                });
+            });
+    });
 }
 
 // ─── Tab management ─────────────────────────────────────────────────

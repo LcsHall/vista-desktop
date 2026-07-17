@@ -1,6 +1,6 @@
 [package]
 name = "vista-platform"
-version = "0.1.2"
+version = "0.1.4"
 description = "Vista Platform desktop app"
 authors = ["Vista Interface"]
 edition = "2021"
@@ -20,12 +20,17 @@ tauri-build = { version = "2", features = [] }
 # / get_webview) that this shell's title-bar + content split relies on;
 # it is NOT in the stable single-webview (WebviewWindow) surface.
 tauri = { version = "2", features = ["tray-icon", "unstable"] }
-# Updater — polls the GitHub Releases manifest configured in
-# tauri.conf.json and installs signed updates. The signing keypair
-# is generated separately via `npm run tauri signer generate`; the
-# private half lives in CI secrets, the public half goes into
-# tauri.conf.json's plugins.updater.pubkey field.
+# Updater — fetches the GitHub Releases manifest configured in
+# tauri.conf.json and installs signed updates. NOTE: the v2 plugin
+# never checks on its own — spawn_update_check() in lib.rs drives it
+# (the old `"dialog": true` config was a Tauri v1 relic the v2 plugin
+# ignored, which left every install from 0.1.0-0.1.3 frozen). The
+# signing keypair is generated separately via `npm run tauri signer
+# generate`; the private half lives in CI secrets, the public half
+# goes into tauri.conf.json's plugins.updater.pubkey field.
 tauri-plugin-updater = "2"
+# Native message dialog for the update prompt.
+tauri-plugin-dialog = "2"
 # Serde for any IPC payloads (window state, etc).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
