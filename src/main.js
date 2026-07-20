@@ -92,6 +92,46 @@ listen('tab:closed', (e) => {
 
 renderTabs();
 
+// ── Call guard (Vista Voice) ─────────────────────────────────────────
+// Rust blocks a window/tab close while a call is live and emits
+// call:close-blocked. We overlay a confirm strip on the title bar:
+// "Keep call" (or 10s of silence) dismisses; "Close anyway" force-closes
+// through the guard — window destroy or forced tab close — hanging up.
+
+const callguardEl = $('callguard');
+const callguardMsg = $('callguard-msg');
+let callguardTarget = null;    // { kind: 'window' } | { kind: 'tab', label }
+let callguardTimer = null;
+
+function hideCallguard() {
+  callguardEl.style.display = 'none';
+  callguardTarget = null;
+  if (callguardTimer) { clearTimeout(callguardTimer); callguardTimer = null; }
+}
+
+$('callguard-keep').addEventListener('click', hideCallguard);
+$('callguard-close').addEventListener('click', () => {
+  const target = callguardTarget;
+  hideCallguard();
+  if (!target) return;
+  if (target.kind === 'window') {
+    invoke('window_force_close').catch(console.error);
+  } else if (target.label) {
+    invoke('close_tab', { label: target.label, force: true }).catch(console.error);
+  }
+});
+
+listen('call:close-blocked', (e) => {
+  const { kind, label } = e.payload || {};
+  callguardTarget = { kind: kind || 'window', label };
+  callguardMsg.textContent = kind === 'tab'
+    ? 'Call in progress — closing the Phone tab will hang up.'
+    : 'Call in progress — closing Vista will hang up.';
+  callguardEl.style.display = 'flex';
+  if (callguardTimer) clearTimeout(callguardTimer);
+  callguardTimer = setTimeout(hideCallguard, 10000);
+}).catch(console.error);
+
 // ── Window controls ──────────────────────────────────────────────────
 
 const btnMin = $('btn-min');

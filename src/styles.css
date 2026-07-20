@@ -17,6 +17,7 @@ html, body {
   align-items: center;
   background: #0f1828;            /* Match the Platform sidebar (Modern theme --vp-sidebar-bg) */
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  position: relative;             /* anchor for the .callguard overlay */
 }
 
 .titlebar__brand {
@@ -163,4 +164,82 @@ html, body {
 .titlebar__btn:focus-visible {
   outline: 2px solid #223E91;
   outline-offset: -3px;
+}
+
+/* ── Call-guard confirm strip (Vista Voice) ─────────────────────────
+   Overlays the whole 40px title bar when the user tries to close the
+   window / Phone tab during a live call. Same navy as the bar so it
+   reads as the bar transforming, not a foreign popup. */
+.callguard {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  background: #0f1828;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.callguard__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #A3E64B;
+  flex-shrink: 0;
+  animation: callguard-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes callguard-pulse {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .callguard__dot { animation: none; }
+}
+
+.callguard__msg {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: #ffffff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.callguard__btn {
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: none;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 80ms ease;
+}
+
+.callguard__btn--keep {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+
+.callguard__btn--keep:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.callguard__btn--close {
+  background: #E81123;
+  color: #ffffff;
+}
+
+.callguard__btn--close:hover {
+  background: #c50e1f;
+}
+
+.callguard__btn:focus-visible {
+  outline: 2px solid #A3E64B;
+  outline-offset: -2px;
 }

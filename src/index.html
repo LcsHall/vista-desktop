@@ -52,6 +52,19 @@
         </svg>
       </button>
     </div>
+
+    <!--
+      Call-guard confirm strip. Hidden until Rust emits call:close-blocked
+      (the user tried to close the window or the Phone tab during a live
+      call). Overlays the whole title bar; "Close anyway" force-closes and
+      hangs up, anything else keeps the call.
+    -->
+    <div class="callguard" id="callguard" role="alertdialog" aria-live="assertive" style="display:none">
+      <span class="callguard__dot" aria-hidden="true"></span>
+      <span class="callguard__msg" id="callguard-msg">Call in progress — closing will hang up.</span>
+      <button class="callguard__btn callguard__btn--keep" id="callguard-keep">Keep call</button>
+      <button class="callguard__btn callguard__btn--close" id="callguard-close">Close anyway</button>
+    </div>
   </div>
 
   <script type="module" src="./main.js"></script>

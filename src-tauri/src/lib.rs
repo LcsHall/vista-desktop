@@ -27,7 +27,7 @@
 // tabs share the app's single WebView2 profile, so the signed-in session
 // cookie is shared across them (no re-login per tab).
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 // `Manager` brings get_webview / get_window / state / manage into scope;
 // `Emitter` brings emit (title-bar notifications). Both, plus the
@@ -84,6 +84,54 @@ const CLOSE_BRIDGE_SCRIPT: &str = r#"(function () {
   };
 })();"#;
 
+// ─── Vista Voice (softphone) support ────────────────────────────────
+//
+// The Phone tab hosts platform.vistainterface.com/manage/<id>/voice, which
+// embeds the Amazon Connect CCP (WebRTC). Three shell-side jobs:
+//
+//   1. Call-active plumbing: the page calls
+//      window.__VISTA_SET_CALL_ACTIVE(active) on Streams contact events.
+//      Same sentinel-navigation trick as the close bridge (the nav is
+//      cancelled in on_navigation, so the page never actually leaves) —
+//      deliberately NOT remote IPC: granting invoke to a remote origin
+//      would expose every command; the sentinel can only flip a boolean.
+//   2. Close guards: while a call is active, closing the window or the
+//      voice tab would hang up on a client with no rejoin (Connect has no
+//      mid-call reconnect). Both are intercepted; the title bar shows a
+//      confirm strip ("Keep call" / "Close anyway").
+//   3. Hidden-tab audio: WebView2 may throttle/occlude a hidden webview,
+//      which could stall call audio. Voice tabs are therefore parked
+//      OFF-SCREEN when inactive (still visible to the compositor → never
+//      throttled) instead of hidden like ordinary tabs.
+const CALL_SENTINEL: &str = "https://vista-desktop.invalid/__call_active__/";
+const VOICE_BRIDGE_SCRIPT: &str = r#"(function () {
+  window.__VISTA_SET_CALL_ACTIVE = function (active) {
+    window.location.href =
+      'https://vista-desktop.invalid/__call_active__/' + (active ? '1' : '0');
+  };
+})();"#;
+
+// Whether a call is live right now (armed by the voice page via the call
+// sentinel; cleared on end/destroy or when the voice tab is force-closed).
+static CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// True when a tab URL is the softphone page (/manage/<companyId>/voice).
+fn is_voice_url(url: &Url) -> bool {
+    url.path().rsplit('/').find(|s| !s.is_empty()) == Some("voice")
+}
+
+/// Hosts whose popups must stay inside WebView2 (shared cookie jar) so the
+/// Connect login session lands where the CCP iframe can read it. Proven in
+/// the ccp-spike: routing these to the system browser strands the login.
+fn is_auth_popup_host(host: &str) -> bool {
+    host.ends_with(".my.connect.aws")
+        || host.ends_with(".awsapps.com")
+        || host.ends_with(".aws.amazon.com")
+        || host.ends_with(".amazonaws.com")
+        || host.ends_with(".amazoncognito.com")
+        || host == "signin.aws.amazon.com"
+}
+
 /// Marks the page as running inside the desktop app. The web app reads
 /// `window.__VISTA_DESKTOP__` to suppress its "install the desktop app"
 /// prompt. Injected at document start into every content/tab webview.
@@ -96,6 +144,9 @@ fn desktop_marker_script() -> String {
 struct TabState {
     order: Vec<String>,
     active: String,
+    /// Labels of tabs hosting the softphone page — these get the
+    /// off-screen park (not hide) and the call-active close guard.
+    voice: Vec<String>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -134,10 +185,22 @@ pub fn run() {
                 .expect("PRODUCTION_URL must be a valid URL");
             let nw_app = app.handle().clone();
             let content = WebviewBuilder::new(PLATFORM_TAB, WebviewUrl::External(prod_url))
-                .initialization_script(desktop_marker_script())
-                .on_new_window(move |url, _features| {
-                    route_new_window(&nw_app, url);
-                    NewWindowResponse::Deny
+                // Voice bridge included for uniformity: if the Platform tab
+                // itself ever lands on the softphone page, the call-active
+                // contract still works (the sidebar normally target=_blanks
+                // it into its own tab).
+                .initialization_script(format!(
+                    "{}{}",
+                    desktop_marker_script(),
+                    VOICE_BRIDGE_SCRIPT
+                ))
+                .on_new_window(move |url, _features| decide_new_window(&nw_app, url))
+                .on_navigation(|nav_url| {
+                    if let Some(flag) = nav_url.as_str().strip_prefix(CALL_SENTINEL) {
+                        CALL_ACTIVE.store(flag.starts_with('1'), Ordering::SeqCst);
+                        return false; // cancel the sentinel nav; page stays put
+                    }
+                    true
                 });
             window.add_child(
                 content,
@@ -145,17 +208,35 @@ pub fn run() {
                 LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT - TITLE_BAR_HEIGHT),
             )?;
 
+            // Mic auto-grant for the softphone (WebView2-level; no-op until
+            // a trusted page actually asks for the microphone).
+            #[cfg(windows)]
+            attach_mic_handler(app.handle(), PLATFORM_TAB);
+
             // Seed tab state with the Platform tab active.
             app.manage(Mutex::new(TabState {
                 order: vec![PLATFORM_TAB.to_string()],
                 active: PLATFORM_TAB.to_string(),
+                voice: Vec::new(),
             }));
 
-            // Keep the title bar + the active tab sized to the window.
+            // Keep the title bar + the active tab sized to the window; block
+            // a window close while a call is live (closing hangs up with no
+            // rejoin — the title bar shows Keep call / Close anyway instead).
             let resize_app = app.handle().clone();
             window.on_window_event(move |event| {
-                if let WindowEvent::Resized(_) = event {
-                    relayout(&resize_app);
+                match event {
+                    WindowEvent::Resized(_) => relayout(&resize_app),
+                    WindowEvent::CloseRequested { api, .. } => {
+                        if CALL_ACTIVE.load(Ordering::SeqCst) {
+                            api.prevent_close();
+                            let _ = resize_app.emit(
+                                "call:close-blocked",
+                                serde_json::json!({ "kind": "window" }),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             });
             // Initial layout once the window is on-screen (the OS may
@@ -173,6 +254,7 @@ pub fn run() {
             window_minimize,
             window_toggle_maximize,
             window_close,
+            window_force_close,
             window_is_maximized,
             switch_tab,
             close_tab,
@@ -224,10 +306,21 @@ fn spawn_update_check(app: &tauri::AppHandle) {
 // ─── Tab management ─────────────────────────────────────────────────
 
 /// Decide where a new-window request (target="_blank" / window.open)
-/// goes: an internal /manage/* page on the Platform host opens as a new
-/// tab; everything else opens in the system browser. Window/webview
-/// mutations are deferred to the main thread to avoid reentrancy while
-/// the webview engine is mid new-window-request.
+/// goes: AWS/Connect auth popups stay INSIDE WebView2 (Allow — the login
+/// popup must share the app's cookie jar or the CCP softphone session
+/// never lands); an internal /manage/* page on the Platform host opens
+/// as a new tab; everything else opens in the system browser.
+fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry> {
+    if is_auth_popup_host(url.host_str().unwrap_or("")) {
+        return NewWindowResponse::Allow;
+    }
+    route_new_window(app, url);
+    NewWindowResponse::Deny
+}
+
+/// Open an internal /manage/* page as a tab, anything else in the system
+/// browser. Window/webview mutations are deferred to the main thread to
+/// avoid reentrancy while the webview engine is mid new-window-request.
 fn route_new_window(app: &AppHandle, url: Url) {
     let is_internal_page =
         url.host_str() == Some(PLATFORM_HOST) && url.path().starts_with("/manage/");
@@ -254,19 +347,26 @@ fn open_tab(app: &AppHandle, url: Url) {
     let nav_app = app.clone();
     let nav_label = label.clone();
     let builder = WebviewBuilder::new(label.as_str(), WebviewUrl::External(url.clone()))
-        // Tabs can themselves open further tabs / external links.
-        .on_new_window(move |u, _features| {
-            route_new_window(&nw_app, u);
-            NewWindowResponse::Deny
-        })
-        // Mark the desktop app, then bridge window.close() → sentinel nav.
-        .initialization_script(format!("{}{}", desktop_marker_script(), CLOSE_BRIDGE_SCRIPT))
+        // Tabs can themselves open further tabs / auth popups / external links.
+        .on_new_window(move |u, _features| decide_new_window(&nw_app, u))
+        // Mark the desktop app, bridge window.close() → sentinel nav, and
+        // give the softphone page its call-active hook.
+        .initialization_script(format!(
+            "{}{}{}",
+            desktop_marker_script(),
+            CLOSE_BRIDGE_SCRIPT,
+            VOICE_BRIDGE_SCRIPT
+        ))
         .on_navigation(move |nav_url| {
             if nav_url.as_str().starts_with(CLOSE_SENTINEL) {
                 let a = nav_app.clone();
                 let l = nav_label.clone();
-                let _ = nav_app.run_on_main_thread(move || close_tab_impl(&a, &l));
+                let _ = nav_app.run_on_main_thread(move || close_tab_impl(&a, &l, false));
                 return false; // cancel the sentinel nav; the tab is closing
+            }
+            if let Some(flag) = nav_url.as_str().strip_prefix(CALL_SENTINEL) {
+                CALL_ACTIVE.store(flag.starts_with('1'), Ordering::SeqCst);
+                return false; // cancel the sentinel nav; the page stays put
             }
             true
         });
@@ -280,10 +380,17 @@ fn open_tab(app: &AppHandle, url: Url) {
         return;
     }
 
+    // Softphone mic auto-grant (no-op unless a trusted page asks).
+    #[cfg(windows)]
+    attach_mic_handler(app, &label);
+
     {
         let state = app.state::<Mutex<TabState>>();
         let mut s = state.lock().unwrap();
         s.order.push(label.clone());
+        if is_voice_url(&url) {
+            s.voice.push(label.clone());
+        }
     }
     // Show the new tab, hide the rest, mark it active.
     activate(app, &label);
@@ -306,13 +413,26 @@ fn activate(app: &AppHandle, label: &str) {
         None => return,
     };
     let content_h = (lh - TITLE_BAR_HEIGHT).max(0.0);
-    let order = { app.state::<Mutex<TabState>>().lock().unwrap().order.clone() };
+    let (order, voice) = {
+        let s = app.state::<Mutex<TabState>>();
+        let s = s.lock().unwrap();
+        (s.order.clone(), s.voice.clone())
+    };
     for l in &order {
         if let Some(wv) = app.get_webview(l) {
             if l == label {
                 let _ = wv.set_position(LogicalPosition::new(0.0, TITLE_BAR_HEIGHT));
                 let _ = wv.set_size(LogicalSize::new(lw, content_h));
                 let _ = wv.show();
+            } else if voice.iter().any(|v| v == l) {
+                // Voice tabs are parked OFF-SCREEN instead of hidden: a
+                // hidden (IsVisible=false) WebView2 can be throttled or
+                // occluded, which risks stalling live call audio. Parked
+                // far left it keeps compositing normally, receives no
+                // input (zero overlap with the window), and the call
+                // keeps flowing while the user works in other tabs.
+                let _ = wv.show();
+                let _ = wv.set_position(LogicalPosition::new(-(lw + 4000.0), TITLE_BAR_HEIGHT));
             } else {
                 let _ = wv.hide();
             }
@@ -323,9 +443,23 @@ fn activate(app: &AppHandle, label: &str) {
 
 /// Close a tab: drop its webview, re-activate a neighbor if it was the
 /// active tab, and tell the title bar. The Platform tab can't be closed.
-/// Runs on the main thread.
-fn close_tab_impl(app: &AppHandle, label: &str) {
+/// A voice tab with a live call refuses to close unless `force` (the
+/// title-bar confirm strip's "Close anyway") — closing it hangs up on the
+/// client with no rejoin. Runs on the main thread.
+fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
     if label == PLATFORM_TAB {
+        return;
+    }
+    let is_voice = {
+        let state = app.state::<Mutex<TabState>>();
+        let s = state.lock().unwrap();
+        s.voice.iter().any(|v| v == label)
+    };
+    if is_voice && !force && CALL_ACTIVE.load(Ordering::SeqCst) {
+        let _ = app.emit(
+            "call:close-blocked",
+            serde_json::json!({ "kind": "tab", "label": label }),
+        );
         return;
     }
     let reactivate = {
@@ -333,6 +467,12 @@ fn close_tab_impl(app: &AppHandle, label: &str) {
         let mut s = state.lock().unwrap();
         if let Some(idx) = s.order.iter().position(|l| l == label) {
             s.order.remove(idx);
+        }
+        s.voice.retain(|v| v != label);
+        // The page that armed the call flag is going away — clear it so a
+        // stale flag can't block closes forever.
+        if is_voice {
+            CALL_ACTIVE.store(false, Ordering::SeqCst);
         }
         if s.active == label {
             // Fall back to the last remaining tab (or Platform).
@@ -372,6 +512,8 @@ fn tab_title(url: &Url) -> String {
         "marketing" => "Marketing".to_string(),
         "waitlist" => "Waitlist".to_string(),
         "schedule" => "Schedule".to_string(),
+        // The softphone page — labeled how the front desk talks about it.
+        "voice" => "Phone".to_string(),
         other => {
             let mut chars = other.chars();
             match chars.next() {
@@ -419,10 +561,11 @@ fn switch_tab(app: AppHandle, label: String) {
 }
 
 #[tauri::command]
-fn close_tab(app: AppHandle, label: String) {
+fn close_tab(app: AppHandle, label: String, force: Option<bool>) {
+    let force = force.unwrap_or(false);
     let _ = app
         .clone()
-        .run_on_main_thread(move || close_tab_impl(&app, &label));
+        .run_on_main_thread(move || close_tab_impl(&app, &label, force));
 }
 
 #[tauri::command]
@@ -444,7 +587,89 @@ fn window_close(window: tauri::Window) -> tauri::Result<()> {
     window.close()
 }
 
+/// Bypass the call-active close guard once the user has confirmed
+/// "Close anyway" in the title bar's confirm strip. destroy() skips
+/// CloseRequested entirely, so the guard can't re-block it.
+#[tauri::command]
+fn window_force_close(window: tauri::Window) -> tauri::Result<()> {
+    window.destroy()
+}
+
 #[tauri::command]
 fn window_is_maximized(window: tauri::Window) -> tauri::Result<bool> {
     window.is_maximized()
+}
+
+// ─── Softphone mic auto-grant (WebView2) ────────────────────────────
+
+/// Auto-grant Microphone at the WebView2 level for trusted origins.
+///
+/// WebView2 shows its own mic prompt and a user's "Block" is sticky with
+/// no re-prompt path — unacceptable for a front-desk softphone. wry only
+/// registers a PermissionRequested handler for clipboard-read, so this
+/// handler is the sole decider for Microphone. Trusted origins: the
+/// Platform app itself (with allowFramedSoftphone, Chromium permission
+/// delegation reports the TOP-LEVEL origin) plus the Connect frame hosts
+/// as a fallback. Everything else keeps the default prompt.
+///
+/// Known caveat (WebView2Feedback#4740, observed in the 2026-07-19
+/// ccp-spike): SetHandled(true) doesn't suppress the default dialog on
+/// every runtime version — "granted silently OR a single prompt" is the
+/// accepted outcome.
+#[cfg(windows)]
+fn attach_mic_handler(app: &AppHandle, label: &str) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2PermissionRequestedEventArgs2, COREWEBVIEW2_PERMISSION_KIND,
+        COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+    };
+    use webview2_com::{take_pwstr, PermissionRequestedEventHandler};
+    use windows::core::{Interface, PWSTR};
+
+    let Some(webview) = app.get_webview(label) else {
+        return;
+    };
+    let result = webview.with_webview(move |platform_webview| {
+        // SAFETY: all WebView2 COM calls happen on the UI thread that
+        // with_webview schedules onto; the handler fires on that thread too.
+        unsafe {
+            let controller = platform_webview.controller();
+            let core = match controller.CoreWebView2() {
+                Ok(core) => core,
+                Err(e) => {
+                    eprintln!("[vista-desktop:mic] CoreWebView2() failed: {e}");
+                    return;
+                }
+            };
+            let handler =
+                PermissionRequestedEventHandler::create(Box::new(move |_sender, args| {
+                    let Some(args) = args else { return Ok(()) };
+                    let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+                    args.PermissionKind(&mut kind)?;
+                    if kind != COREWEBVIEW2_PERMISSION_KIND_MICROPHONE {
+                        return Ok(());
+                    }
+                    let mut uri = PWSTR::null();
+                    args.Uri(&mut uri)?;
+                    let uri = take_pwstr(uri);
+                    let trusted = uri.starts_with("https://platform.vistainterface.com")
+                        || uri.contains(".my.connect.aws")
+                        || uri.contains(".awsapps.com");
+                    if trusted {
+                        args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
+                        // Best effort — see the #4740 caveat above.
+                        let _ = args
+                            .cast::<ICoreWebView2PermissionRequestedEventArgs2>()
+                            .and_then(|a2| a2.SetHandled(true));
+                    }
+                    Ok(())
+                }));
+            let mut token: i64 = 0;
+            if let Err(e) = core.add_PermissionRequested(&handler, &mut token) {
+                eprintln!("[vista-desktop:mic] add_PermissionRequested failed: {e}");
+            }
+        }
+    });
+    if let Err(e) = result {
+        eprintln!("[vista-desktop:mic] with_webview failed for {label}: {e}");
+    }
 }

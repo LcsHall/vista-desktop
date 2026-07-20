@@ -41,6 +41,15 @@ serde_json = "1"
 # from Rust, so it needs no Tauri capability/permission grant.
 open = "5"
 
+# Raw WebView2 COM surface for the softphone's mic auto-grant (a
+# PermissionRequested handler — wry only registers its own handler for
+# clipboard-read, so Microphone is ours to decide). Versions pinned to
+# match what tauri 2.x / wry already pull in so we share the exact same
+# COM types (proven in the 2026-07-19 ccp-spike).
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows = { version = "0.61", features = ["Win32_Foundation"] }
+
 [features]
 # This feature is used for production builds or when a dev server is
 # not specified, DO NOT REMOVE!!
