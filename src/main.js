@@ -82,6 +82,15 @@ listen('tab:opened', (e) => {
   renderTabs();
 }).catch(console.error);
 
+// Rust focused an existing singleton tab (Phone / Phone settings dedupe)
+// instead of opening a duplicate.
+listen('tab:focused', (e) => {
+  const { label } = e.payload || {};
+  if (!label || !tabs.some((t) => t.label === label)) return;
+  active = label;
+  renderTabs();
+}).catch(console.error);
+
 // Rust closed a tab (via the ✕, or a page's own window.close()).
 listen('tab:closed', (e) => {
   const { label, active: nextActive } = e.payload || {};

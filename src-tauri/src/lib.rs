@@ -104,12 +104,25 @@ const CLOSE_BRIDGE_SCRIPT: &str = r#"(function () {
 //      OFF-SCREEN when inactive (still visible to the compositor → never
 //      throttled) instead of hidden like ordinary tabs.
 const CALL_SENTINEL: &str = "https://vista-desktop.invalid/__call_active__/";
+// Fired by the voice page the moment the CCP agent session is live. The shell
+// uses it to close the managed Connect sign-in window (see LOGIN_WINDOW):
+// "agent ready" is the one authoritative signal that login truly finished —
+// more reliable than watching the login window's own redirects.
+const AGENT_READY_SENTINEL: &str = "https://vista-desktop.invalid/__agent_ready__";
 const VOICE_BRIDGE_SCRIPT: &str = r#"(function () {
   window.__VISTA_SET_CALL_ACTIVE = function (active) {
     window.location.href =
       'https://vista-desktop.invalid/__call_active__/' + (active ? '1' : '0');
   };
+  window.__VISTA_AGENT_READY = function () {
+    window.location.href = 'https://vista-desktop.invalid/__agent_ready__';
+  };
 })();"#;
+
+// Label of the managed Connect sign-in window (Tauri-owned so the shell can
+// close it deterministically — the engine-native popup WebView2 spawns for
+// window.open could linger as a fully-functional duplicate CCP).
+const LOGIN_WINDOW: &str = "connect-login";
 
 // Whether a call is live right now (armed by the voice page via the call
 // sentinel; cleared on end/destroy or when the voice tab is force-closed).
@@ -147,6 +160,9 @@ struct TabState {
     /// Labels of tabs hosting the softphone page — these get the
     /// off-screen park (not hide) and the call-active close guard.
     voice: Vec<String>,
+    /// Labels of Phone-settings tabs (deduped like voice tabs — re-opening
+    /// focuses the existing one instead of stacking duplicates).
+    settings: Vec<String>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -184,6 +200,7 @@ pub fn run() {
                 .parse()
                 .expect("PRODUCTION_URL must be a valid URL");
             let nw_app = app.handle().clone();
+            let nav_plat_app = app.handle().clone();
             let content = WebviewBuilder::new(PLATFORM_TAB, WebviewUrl::External(prod_url))
                 // Voice bridge included for uniformity: if the Platform tab
                 // itself ever lands on the softphone page, the call-active
@@ -195,10 +212,14 @@ pub fn run() {
                     VOICE_BRIDGE_SCRIPT
                 ))
                 .on_new_window(move |url, _features| decide_new_window(&nw_app, url))
-                .on_navigation(|nav_url| {
+                .on_navigation(move |nav_url| {
                     if let Some(flag) = nav_url.as_str().strip_prefix(CALL_SENTINEL) {
                         CALL_ACTIVE.store(flag.starts_with('1'), Ordering::SeqCst);
                         return false; // cancel the sentinel nav; page stays put
+                    }
+                    if nav_url.as_str().starts_with(AGENT_READY_SENTINEL) {
+                        close_login_window(&nav_plat_app);
+                        return false;
                     }
                     true
                 });
@@ -218,6 +239,7 @@ pub fn run() {
                 order: vec![PLATFORM_TAB.to_string()],
                 active: PLATFORM_TAB.to_string(),
                 voice: Vec::new(),
+                settings: Vec::new(),
             }));
 
             // Keep the title bar + the active tab sized to the window; block
@@ -306,16 +328,47 @@ fn spawn_update_check(app: &tauri::AppHandle) {
 // ─── Tab management ─────────────────────────────────────────────────
 
 /// Decide where a new-window request (target="_blank" / window.open)
-/// goes: AWS/Connect auth popups stay INSIDE WebView2 (Allow — the login
-/// popup must share the app's cookie jar or the CCP softphone session
-/// never lands); an internal /manage/* page on the Platform host opens
-/// as a new tab; everything else opens in the system browser.
+/// goes: AWS/Connect auth popups open in a MANAGED Tauri window (same
+/// WebView2 profile → same cookie jar the CCP session needs, but a window
+/// the shell can deterministically close — the engine-native popup could
+/// linger after login as a fully-functional duplicate CCP); an internal
+/// /manage/* page on the Platform host opens as a new tab; everything
+/// else opens in the system browser.
 fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry> {
     if is_auth_popup_host(url.host_str().unwrap_or("")) {
-        return NewWindowResponse::Allow;
+        let app = app.clone();
+        let _ = app
+            .clone()
+            .run_on_main_thread(move || open_login_window(&app, url));
+        return NewWindowResponse::Deny;
     }
     route_new_window(app, url);
     NewWindowResponse::Deny
+}
+
+/// Open (or focus) the managed Connect sign-in window. Closed by the
+/// agent-ready sentinel once the softphone session is live, so it can only
+/// ever exist while a sign-in is genuinely in progress.
+fn open_login_window(app: &AppHandle, url: Url) {
+    if let Some(existing) = app.get_webview_window(LOGIN_WINDOW) {
+        let _ = existing.set_focus();
+        return;
+    }
+    let result = tauri::WebviewWindowBuilder::new(app, LOGIN_WINDOW, WebviewUrl::External(url))
+        .title("Sign in — Vista Phone")
+        .inner_size(480.0, 700.0)
+        .center()
+        .build();
+    if let Err(e) = result {
+        eprintln!("[vista-desktop] failed to open login window: {e}");
+    }
+}
+
+/// Close the managed sign-in window (agent session is live → login done).
+fn close_login_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window(LOGIN_WINDOW) {
+        let _ = w.close();
+    }
 }
 
 /// Open an internal /manage/* page as a tab, anything else in the system
@@ -339,6 +392,27 @@ fn open_tab(app: &AppHandle, url: Url) {
         Some(w) => w,
         None => return,
     };
+
+    // Dedupe the singleton tabs: re-opening Phone or Phone settings (sidebar
+    // re-click, click-to-call fallback) FOCUSES the existing tab instead of
+    // stacking a duplicate — two live CCPs would be two competing softphones.
+    let is_settings_url =
+        url.path().rsplit('/').find(|s| !s.is_empty()) == Some("voice-settings");
+    if is_voice_url(&url) || is_settings_url {
+        let candidates = {
+            let s = app.state::<Mutex<TabState>>();
+            let s = s.lock().unwrap();
+            if is_settings_url { s.settings.clone() } else { s.voice.clone() }
+        };
+        for l in candidates {
+            if app.get_webview(&l).is_some() {
+                activate(app, &l);
+                let _ = app.emit("tab:focused", serde_json::json!({ "label": l }));
+                return;
+            }
+        }
+    }
+
     let label = format!("tab-{}", TAB_COUNTER.fetch_add(1, Ordering::Relaxed));
     let (lw, lh) = logical_inner(&window).unwrap_or((INITIAL_WIDTH, INITIAL_HEIGHT));
     let content_h = (lh - TITLE_BAR_HEIGHT).max(0.0);
@@ -368,6 +442,10 @@ fn open_tab(app: &AppHandle, url: Url) {
                 CALL_ACTIVE.store(flag.starts_with('1'), Ordering::SeqCst);
                 return false; // cancel the sentinel nav; the page stays put
             }
+            if nav_url.as_str().starts_with(AGENT_READY_SENTINEL) {
+                close_login_window(&nav_app);
+                return false;
+            }
             true
         });
 
@@ -390,6 +468,8 @@ fn open_tab(app: &AppHandle, url: Url) {
         s.order.push(label.clone());
         if is_voice_url(&url) {
             s.voice.push(label.clone());
+        } else if is_settings_url {
+            s.settings.push(label.clone());
         }
     }
     // Show the new tab, hide the rest, mark it active.
@@ -469,6 +549,7 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
             s.order.remove(idx);
         }
         s.voice.retain(|v| v != label);
+        s.settings.retain(|v| v != label);
         // The page that armed the call flag is going away — clear it so a
         // stale flag can't block closes forever.
         if is_voice {
@@ -514,6 +595,7 @@ fn tab_title(url: &Url) -> String {
         "schedule" => "Schedule".to_string(),
         // The softphone page — labeled how the front desk talks about it.
         "voice" => "Phone".to_string(),
+        "voice-settings" => "Phone settings".to_string(),
         other => {
             let mut chars = other.chars();
             match chars.next() {
