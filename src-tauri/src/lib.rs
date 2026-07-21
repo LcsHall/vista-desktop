@@ -109,13 +109,18 @@ const CALL_SENTINEL: &str = "https://vista-desktop.invalid/__call_active__/";
 // "agent ready" is the one authoritative signal that login truly finished —
 // more reliable than watching the login window's own redirects.
 const AGENT_READY_SENTINEL: &str = "https://vista-desktop.invalid/__agent_ready__";
+// NOTE: these signals use window.open(), NOT location.href. A top-level
+// navigation (even one on_navigation cancels) fires beforeunload first,
+// and the CCP iframe registers a leave-warning handler — so every call
+// start/end popped a native "Leave site?" dialog. window.open() routes
+// through on_new_window instead (decide_new_window swallows sentinels)
+// and never triggers unload machinery.
 const VOICE_BRIDGE_SCRIPT: &str = r#"(function () {
   window.__VISTA_SET_CALL_ACTIVE = function (active) {
-    window.location.href =
-      'https://vista-desktop.invalid/__call_active__/' + (active ? '1' : '0');
+    window.open('https://vista-desktop.invalid/__call_active__/' + (active ? '1' : '0'));
   };
   window.__VISTA_AGENT_READY = function () {
-    window.location.href = 'https://vista-desktop.invalid/__agent_ready__';
+    window.open('https://vista-desktop.invalid/__agent_ready__');
   };
 })();"#;
 
@@ -335,6 +340,19 @@ fn spawn_update_check(app: &tauri::AppHandle) {
 /// /manage/* page on the Platform host opens as a new tab; everything
 /// else opens in the system browser.
 fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry> {
+    // Voice-bridge sentinels arrive as window.open() (see VOICE_BRIDGE_SCRIPT
+    // beforeunload note) — consume them here, open nothing.
+    if let Some(flag) = url.as_str().strip_prefix(CALL_SENTINEL) {
+        CALL_ACTIVE.store(flag.starts_with('1'), Ordering::SeqCst);
+        return NewWindowResponse::Deny;
+    }
+    if url.as_str().starts_with(AGENT_READY_SENTINEL) {
+        let app = app.clone();
+        let _ = app
+            .clone()
+            .run_on_main_thread(move || close_login_window(&app));
+        return NewWindowResponse::Deny;
+    }
     if is_auth_popup_host(url.host_str().unwrap_or("")) {
         let app = app.clone();
         let _ = app
