@@ -109,6 +109,13 @@ const CALL_SENTINEL: &str = "https://vista-desktop.invalid/__call_active__/";
 // "agent ready" is the one authoritative signal that login truly finished —
 // more reliable than watching the login window's own redirects.
 const AGENT_READY_SENTINEL: &str = "https://vista-desktop.invalid/__agent_ready__";
+// Fired by the voice page when it detects a dead/wedged CCP (post-sleep,
+// network loss, or Streams' 6-retry ceiling exhausted) and wants a HARD
+// reconnect. A plain page reload can't clear the CCP shared worker living in
+// the shared WebView2 profile — only recreating the webview does. The page
+// only fires this when NO call is active (a re-init mid-call = ghost call), so
+// the shell can force-close + reopen the Phone tab safely.
+const RECONNECT_SENTINEL: &str = "https://vista-desktop.invalid/__reconnect_phone__";
 // NOTE: these signals use window.open(), NOT location.href. A top-level
 // navigation (even one on_navigation cancels) fires beforeunload first,
 // and the CCP iframe registers a leave-warning handler — so every call
@@ -122,6 +129,9 @@ const VOICE_BRIDGE_SCRIPT: &str = r#"(function () {
   window.__VISTA_AGENT_READY = function () {
     window.open('https://vista-desktop.invalid/__agent_ready__');
   };
+  window.__VISTA_RECONNECT_PHONE = function () {
+    window.open('https://vista-desktop.invalid/__reconnect_phone__');
+  };
 })();"#;
 
 // Label of the managed Connect sign-in window (Tauri-owned so the shell can
@@ -132,6 +142,37 @@ const LOGIN_WINDOW: &str = "connect-login";
 // Whether a call is live right now (armed by the voice page via the call
 // sentinel; cleared on end/destroy or when the voice tab is force-closed).
 static CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Set the call-active flag AND (Windows) hold/release a system-sleep block so
+/// a live call can't be dropped by the machine sleeping. The power request is
+/// scheduled onto the MAIN thread so the set (during call) and clear (call end)
+/// run on the SAME thread — SetThreadExecutionState's ES_CONTINUOUS state is
+/// per-thread, so a clear from a different thread would leave the block stuck
+/// on and the machine awake forever. Sleep is only blocked DURING a call; an
+/// idle desk (or overnight) still sleeps normally — recovery on wake is the
+/// voice page's job.
+fn set_call_active(app: &AppHandle, active: bool) {
+    CALL_ACTIVE.store(active, Ordering::SeqCst);
+    #[cfg(windows)]
+    {
+        let _ = app.run_on_main_thread(move || {
+            use windows::Win32::System::Power::{
+                SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED, EXECUTION_STATE,
+            };
+            // SAFETY: a bare Win32 call with no pointers; always on the main thread.
+            unsafe {
+                let flags = if active {
+                    EXECUTION_STATE(ES_CONTINUOUS.0 | ES_SYSTEM_REQUIRED.0)
+                } else {
+                    ES_CONTINUOUS
+                };
+                let _ = SetThreadExecutionState(flags);
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+}
 
 /// True when a tab URL is the softphone page (/manage/<companyId>/voice).
 fn is_voice_url(url: &Url) -> bool {
@@ -172,6 +213,16 @@ struct TabState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Let the CCP ringtone + remote-call audio play without a user gesture.
+    // A parked/off-screen phone webview never gets a gesture, so Chromium's
+    // autoplay policy would keep the AudioContext suspended → no ring, no
+    // inbound audio. Must be set before any WebView2 environment is created.
+    // (Belt-and-suspenders with the page's silent-AudioContext keep-alive.)
+    #[cfg(windows)]
+    std::env::set_var(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--autoplay-policy=no-user-gesture-required",
+    );
     tauri::Builder::default()
         // Updater plugin: endpoint + pubkey configured in tauri.conf.json.
         // Registration alone does NOTHING in Tauri 2 — the launch check
@@ -219,7 +270,7 @@ pub fn run() {
                 .on_new_window(move |url, _features| decide_new_window(&nw_app, url))
                 .on_navigation(move |nav_url| {
                     if let Some(flag) = nav_url.as_str().strip_prefix(CALL_SENTINEL) {
-                        CALL_ACTIVE.store(flag.starts_with('1'), Ordering::SeqCst);
+                        set_call_active(&nav_plat_app, flag.starts_with('1'));
                         return false; // cancel the sentinel nav; page stays put
                     }
                     if nav_url.as_str().starts_with(AGENT_READY_SENTINEL) {
@@ -343,7 +394,7 @@ fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry>
     // Voice-bridge sentinels arrive as window.open() (see VOICE_BRIDGE_SCRIPT
     // beforeunload note) — consume them here, open nothing.
     if let Some(flag) = url.as_str().strip_prefix(CALL_SENTINEL) {
-        CALL_ACTIVE.store(flag.starts_with('1'), Ordering::SeqCst);
+        set_call_active(app, flag.starts_with('1'));
         return NewWindowResponse::Deny;
     }
     if url.as_str().starts_with(AGENT_READY_SENTINEL) {
@@ -351,6 +402,13 @@ fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry>
         let _ = app
             .clone()
             .run_on_main_thread(move || close_login_window(&app));
+        return NewWindowResponse::Deny;
+    }
+    if url.as_str().starts_with(RECONNECT_SENTINEL) {
+        let app = app.clone();
+        let _ = app
+            .clone()
+            .run_on_main_thread(move || reconnect_voice(&app));
         return NewWindowResponse::Deny;
     }
     if is_auth_popup_host(url.host_str().unwrap_or("")) {
@@ -400,6 +458,35 @@ fn route_new_window(app: &AppHandle, url: Url) {
         let _ = app.clone().run_on_main_thread(move || open_tab(&app, url));
     } else if let Err(e) = open::that_detached(url.as_str()) {
         eprintln!("[vista-desktop] failed to open {url} in browser: {e}");
+    }
+}
+
+/// Hard-reconnect the softphone: force-close the (single) Phone tab and reopen
+/// a fresh one at the same URL. The voice page only fires the reconnect
+/// sentinel when NO call is live, so force-closing is safe; recreating the
+/// webview clears the wedged CCP shared worker a page reload can't. Runs on the
+/// main thread.
+fn reconnect_voice(app: &AppHandle) {
+    let voice_label = {
+        let s = app.state::<Mutex<TabState>>();
+        let s = s.lock().unwrap();
+        s.voice.first().cloned()
+    };
+    let Some(label) = voice_label else { return };
+    // Capture the page URL before we tear the webview down, so we reopen the
+    // same softphone page (companyId and all).
+    let url = app.get_webview(&label).and_then(|wv| wv.url().ok());
+    close_tab_impl(app, &label, true);
+    if let Some(url) = url {
+        // Let the terminate-at-close teardown (its 700ms deferred webview drop)
+        // finish before opening the replacement, so the old CCP is fully gone
+        // and its label is out of TabState (open_tab won't dedupe onto it).
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(900));
+            let a = app2.clone();
+            let _ = app2.run_on_main_thread(move || open_tab(&a, url));
+        });
     }
 }
 
@@ -457,7 +544,7 @@ fn open_tab(app: &AppHandle, url: Url) {
                 return false; // cancel the sentinel nav; the tab is closing
             }
             if let Some(flag) = nav_url.as_str().strip_prefix(CALL_SENTINEL) {
-                CALL_ACTIVE.store(flag.starts_with('1'), Ordering::SeqCst);
+                set_call_active(&nav_app, flag.starts_with('1'));
                 return false; // cancel the sentinel nav; the page stays put
             }
             if nav_url.as_str().starts_with(AGENT_READY_SENTINEL) {
@@ -571,7 +658,7 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
         // The page that armed the call flag is going away — clear it so a
         // stale flag can't block closes forever.
         if is_voice {
-            CALL_ACTIVE.store(false, Ordering::SeqCst);
+            set_call_active(app, false);
         }
         if s.active == label {
             // Fall back to the last remaining tab (or Platform).
