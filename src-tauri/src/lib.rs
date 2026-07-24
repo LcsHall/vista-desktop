@@ -586,7 +586,33 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
         }
     };
     if let Some(wv) = app.get_webview(label) {
-        let _ = wv.close();
+        if is_voice {
+            // The Phone tab's Amazon Connect CCP keeps a shared worker + login
+            // session alive in the app's SHARED WebView2 profile — state that
+            // outlives this webview. Destroying the webview abruptly (as the
+            // else-branch does) never runs the page's connect.core.terminate(),
+            // so the orphaned state jams the NEXT Phone tab on "Initializing…".
+            // Platform-side terminate-before-init can't clear it (a fresh page's
+            // terminate doesn't reach the orphan) — it must be torn down while
+            // its OWN webview is still alive. So: terminate CCP in-page, give it
+            // a beat to reach the shared worker, THEN destroy the webview.
+            let _ = wv.eval(
+                "try{window.connect&&window.connect.core&&window.connect.core.terminate&&window.connect.core.terminate()}catch(e){}",
+            );
+            let app_close = app.clone();
+            let label_close = label.to_string();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                let app_inner = app_close.clone();
+                let _ = app_close.run_on_main_thread(move || {
+                    if let Some(wv) = app_inner.get_webview(&label_close) {
+                        let _ = wv.close();
+                    }
+                });
+            });
+        } else {
+            let _ = wv.close();
+        }
     }
     if let Some(next) = &reactivate {
         activate(app, next);
