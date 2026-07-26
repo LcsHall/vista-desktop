@@ -108,8 +108,14 @@ Replace `REPLACE_WITH_PUBLIC_KEY_FROM_TAURI_SIGNER_GENERATE` in
 
 ## Cut a release
 
+Bump the version in **three** files, keeping them identical:
+`package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`.
+Miss `Cargo.toml` and the release fails — `scripts/check-versions.mjs`
+compares all three, and `release.yml` runs it before the slow Rust
+build. `Cargo.lock` is gitignored, so there's nothing to regenerate.
+
 ```bash
-# Bump version in src-tauri/tauri.conf.json AND package.json
+node scripts/check-versions.mjs v0.2.0   # verify locally first
 git add -A && git commit -m "Release v0.2.0"
 git tag v0.2.0
 git push origin master
@@ -119,8 +125,10 @@ git push origin v0.2.0
 The `release.yml` workflow runs on tag push. ~10 min later you'll have
 a draft GitHub Release with:
 - Windows: `Vista Platform_0.2.0_x64_en-US.msi` + `Vista Platform_0.2.0_x64-setup.exe`
-- Mac: `Vista Platform_0.2.0_x64.dmg` + `Vista Platform_0.2.0_aarch64.dmg`
 - `latest.json` — the updater manifest
+
+Mac builds are commented out in `release.yml` until Apple signing and
+notarization are set up; without a cert the build fails every release.
 
 Edit the draft, add release notes, publish. Every installed user gets
 an auto-update prompt on next launch.

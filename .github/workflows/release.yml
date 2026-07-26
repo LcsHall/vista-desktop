@@ -5,11 +5,14 @@ name: Release
 # bundles the right CLI commands per platform.
 #
 # To cut a release:
-#   1. Bump the "version" field in src-tauri/tauri.conf.json AND
-#      package.json (keep them in sync)
+#   1. Bump the "version" field in ALL THREE of package.json,
+#      src-tauri/tauri.conf.json and src-tauri/Cargo.toml (keep them
+#      identical) — the "Verify tag matches versions" step below runs
+#      scripts/check-versions.mjs, which compares all three against the
+#      tag and fails the build if any disagree
 #   2. Commit + push
 #   3. Tag: `git tag v0.2.0 && git push origin v0.2.0`
-#   4. Wait ~10 min for both runners to finish
+#   4. Wait ~10 min for the Windows runner to finish
 #   5. Edit the generated draft release (add notes), then publish
 
 on:
