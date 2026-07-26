@@ -49,7 +49,14 @@ function renderTabs() {
     if (tab.closeable) {
       const close = document.createElement('span');
       close.className = 'titlebar__tab-close';
-      close.textContent = '✕';
+      // An SVG, not the ✕ glyph: this sits beside the window controls, and
+      // their 1.2px strokes are the reference. A text glyph renders at
+      // whatever weight the installed font decides.
+      close.innerHTML =
+        '<svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true">' +
+        '<path d="M3.2 3.2l5.6 5.6M8.8 3.2l-5.6 5.6" stroke="currentColor" ' +
+        'stroke-width="1.3" stroke-linecap="round"/></svg>';
+      close.setAttribute('role', 'button');
       close.setAttribute('aria-label', `Close ${tab.title}`);
       close.addEventListener('click', (e) => {
         e.stopPropagation();          // don't also switch to the tab

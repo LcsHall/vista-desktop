@@ -16,7 +16,10 @@ html, body {
   display: flex;
   align-items: center;
   background: #0f1828;            /* Match the Platform sidebar (Modern theme --vp-sidebar-bg) */
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  /* The bottom hairline is an inset shadow, not a border, so the active tab
+     can seat on top of it — an inset shadow paints under child content,
+     a border doesn't. It also keeps the content box a full 40px. */
+  box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.08);
   position: relative;             /* anchor for the .callguard overlay */
 }
 
@@ -39,12 +42,13 @@ html, body {
 
 /* ── Tab strip ─────────────────────────────────────────────────────── */
 
+/* Tabs are bottom-aligned so the active card seats on the bar's hairline. */
 .titlebar__tabs {
   display: flex;
-  align-items: center;
-  gap: 4px;
+  align-items: flex-end;
+  gap: 2px;
   height: 100%;
-  padding: 0 2px;
+  padding: 0 4px;
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -54,11 +58,13 @@ html, body {
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 28px;
+  height: 30px;
   max-width: 200px;
-  padding: 0 6px 0 12px;
+  padding: 0 8px 0 13px;
   border: none;
-  border-radius: 7px;
+  /* Only the top corners round. Nothing straight ever has to meet a curve,
+     which is what made the old accent rule look clipped. */
+  border-radius: 8px 8px 0 0;
   background: transparent;
   color: rgba(255, 255, 255, 0.65);
   font-size: 12.5px;
@@ -67,31 +73,39 @@ html, body {
   cursor: pointer;
   white-space: nowrap;
   outline: none;
-  transition: background-color 80ms ease, color 80ms ease;
+  transition: background-color 90ms ease, color 90ms ease;
 }
 
 .titlebar__tab:hover {
-  background: rgba(255, 255, 255, 0.06);
-  color: #ffffff;
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.9);
 }
 
-/* Active tab: white "card" with a thin green accent underline, echoing
-   the platform sidebar's active treatment. */
+/* Active tab: a solid card seated on the bottom edge, joining the tab to
+   the page it opens. Solid rather than translucent white — a white wash
+   over this navy goes grey. The 1px top highlight gives it its lift. */
 .titlebar__tab--active {
-  background: rgba(255, 255, 255, 0.10);
+  background: #1B2942;
   color: #ffffff;
   font-weight: 600;
-  box-shadow: inset 0 -2px 0 #2E7D5B;   /* green accent underline, echoing the sidebar's active item */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09);
+}
+
+.titlebar__tab:focus-visible {
+  outline: 2px solid #223E91;
+  outline-offset: -2px;
 }
 
 /* Pages with no ✕ (the Platform tab) shouldn't reserve the close slot. */
-.titlebar__tab--fixed { padding-right: 12px; }
+.titlebar__tab--fixed { padding-right: 13px; }
 
 .titlebar__tab-label {
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+/* Hidden until the tab is hovered or active, but the box is always laid
+   out, so revealing it never reflows the strip. */
 .titlebar__tab-close {
   display: flex;
   align-items: center;
@@ -103,16 +117,22 @@ html, body {
   background: transparent;
   color: inherit;
   cursor: pointer;
-  font-size: 13px;
-  line-height: 1;
-  opacity: 0.6;
+  opacity: 0;
   flex: 0 0 auto;
+  transition: opacity 90ms ease, background-color 90ms ease;
+}
+
+.titlebar__tab:hover .titlebar__tab-close,
+.titlebar__tab--active .titlebar__tab-close {
+  opacity: 0.5;
 }
 
 .titlebar__tab-close:hover {
   background: rgba(255, 255, 255, 0.15);
   opacity: 1;
 }
+
+.titlebar__tab-close svg { display: block; }
 
 .titlebar__spacer {
   flex: 1 1 auto;
