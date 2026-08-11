@@ -84,6 +84,177 @@ const CLOSE_BRIDGE_SCRIPT: &str = r#"(function () {
   };
 })();"#;
 
+// ─── Native dialog globals (confirm / alert / prompt) ───────────────
+//
+// COMPENSATES FOR: tauri-plugin-dialog 2.7.1 (pinned via Cargo.lock).
+//
+// That plugin's `init()` unconditionally injects `src/init-iife.js` on every
+// non-Android target — there is no opt-out — and that script does:
+//
+//     window.alert   = function (m) { invoke('plugin:dialog|message', ...) }
+//     window.confirm = async function (m) { return await invoke('plugin:dialog|confirm', ...) }
+//
+// Two independent defects follow, and the confirm one is a DATA-LOSS bug:
+//
+//  1. `confirm` is now an ASYNC function, so it returns a Promise — and a
+//     Promise is ALWAYS truthy. Every guard in the web apps inverts:
+//         if (!confirm('Are you sure?')) return;   // never returns
+//         if (confirm('Delete?')) doDelete();      // always deletes
+//     ~167 confirm-gated destructive actions reachable from this shell
+//     therefore execute IMMEDIATELY, with no prompt shown. Worse, the
+//     plugin registers NO `confirm` command at all — its generate_handler!
+//     lists only open/save/message — so the invoke can never succeed.
+//  2. `alert` maps to `plugin:dialog|message`, which IS a real command, but
+//     our capability grants no `remote` origin access and every content
+//     webview loads a remote https:// origin, so the invoke is denied by the
+//     ACL. ~206 alert() calls display NOTHING and swallow a rejected promise.
+//
+// `prompt` is NOT touched by 2.7.1; it is pinned here purely so a future
+// plugin version can't start overriding it without us noticing.
+//
+// WHY THIS WORKS — the facts it rests on, verified in the vendored sources
+// and then MEASURED in a real Chromium (Edge 151, the same engine generation
+// as the installed WebView2 151.0.4129.72) rather than assumed:
+//
+//  * ORDERING: tauri `src/manager/webview.rs:202` pushes the plugin scripts,
+//    then :223 does
+//        all_initialization_scripts.extend(webview_attributes.initialization_scripts)
+//    i.e. OUR WebviewBuilder::initialization_script runs strictly AFTER the
+//    plugin's. (Confirmed identical in 2.11.2 and 2.11.5.) Naively caching
+//    `window.confirm` at the top of this script would therefore capture the
+//    plugin's async version and fix nothing.
+//  * WHERE THE NATIVE SURVIVES — *NOT* on `Window.prototype`. Measured: in
+//    Chromium `alert`/`confirm`/`prompt` are OWN properties of the global
+//    (writable+configurable+enumerable) and `Window.prototype` does not have
+//    them at all (`typeof Window.prototype.confirm === 'undefined'`; the whole
+//    chain is Window -> EventTarget -> EventTarget -> Object). That is the
+//    WebIDL [Global] rule: members of a [Global] interface are installed as
+//    own properties of the global object, not on the prototype. So the
+//    plugin's `window.confirm = ...` genuinely DESTROYS the only reference
+//    this realm had, and the `Object.getPrototypeOf(window)` branch in
+//    native() below never matches on this engine.
+//    => THE IFRAME BRANCH IS THE LOAD-BEARING PATH, on every call. A
+//    same-origin about:blank child frame is a fresh realm with pristine
+//    natives, and tauri injects both the plugin's script and ours with
+//    `for_main_frame_only: true` (plugin.rs:370-373 / webview/mod.rs:868-875),
+//    so neither script runs inside that frame and it stays clean. Verified
+//    over CDP: every dialog the fixed page raises reports `url: about:blank`,
+//    returns a real boolean, and honours OK vs Cancel — in BOTH injection
+//    orders. Keep the prototype branch as a cheap fast-path for engines
+//    where it does hold, but do not rely on it.
+//
+// The install uses an ACCESSOR whose setter silently swallows writes, which
+// makes the fix correct REGARDLESS of injection order: if a future tauri
+// reverses the order, the plugin's `window.confirm = ...` hits our no-op
+// setter and is discarded. A frozen data property would also block it but
+// would THROW a TypeError inside the plugin's strict-mode IIFE — a no-op
+// setter does not. `configurable: true` keeps it debuggable/replaceable.
+//
+// Every path fails CLOSED: if no native can be resolved, confirm returns
+// false and prompt returns null, so a guard blocks rather than fails open.
+//
+// ⚠️ RE-CHECK ON ANY tauri / tauri-plugin-dialog BUMP. A dependency bump
+// silently reintroducing this is the obvious regression path. Verify:
+//   1. Does the plugin still inject init-iife.js, and does it still override
+//      confirm/alert (and now prompt)? If upstream fixed it, delete this.
+//   2. Does `generate_handler!` in the plugin's lib.rs register a real
+//      `confirm` command now?
+//   3. Is the init-script ordering in manager/webview.rs still
+//      plugins-then-builder? (If it flips, the accessor already covers us.)
+//   4. Are BOTH scripts still `for_main_frame_only: true`? If tauri or the
+//      plugin ever switches to js_init_script_on_all_frames, the plugin's
+//      override would follow us into the fallback iframe, isNative() would
+//      reject it, and every confirm would fail closed to `false` — i.e. every
+//      confirm-gated action becomes impossible to complete. Loud, not silent,
+//      but a total outage of ~165 features.
+// NOTE: adding `dialog:allow-confirm`/`dialog:allow-ask` to the capability is
+// NOT a fix and was already tried — in 2.7.1 both are DEPRECATED ALIASES for
+// the `message` command that `dialog:default` already grants. No ACL entry can
+// authorise a command the plugin never registers.
+const DIALOG_GLOBALS_SCRIPT: &str = r#"(function () {
+  'use strict';
+
+  function isNative(fn) {
+    try {
+      return typeof fn === 'function' &&
+        Function.prototype.toString.call(fn).indexOf('[native code]') !== -1;
+    } catch (e) { return false; }
+  }
+
+  // Fallback only: a same-origin about:blank frame is a fresh realm whose
+  // globals the plugin never touched (its script is main-frame-only). Kept
+  // attached and re-created if the page ever tears it out — a detached
+  // frame's dialog methods silently become no-ops.
+  var frameEl = null;
+  function frameWin() {
+    try {
+      if (frameEl && frameEl.isConnected && frameEl.contentWindow) return frameEl.contentWindow;
+      var root = document.documentElement || document.body;
+      if (!root) return null;
+      frameEl = document.createElement('iframe');
+      frameEl.setAttribute('aria-hidden', 'true');
+      frameEl.setAttribute('tabindex', '-1');
+      frameEl.style.cssText =
+        'position:absolute;left:-9999px;top:0;width:1px;height:1px;border:0;';
+      root.appendChild(frameEl);
+      return frameEl.contentWindow;
+    } catch (e) { return null; }
+  }
+
+  var cache = {};
+  function native(name) {
+    if (cache[name]) return cache[name];
+    var proto = Object.getPrototypeOf(window);
+    var fn = proto ? proto[name] : null;
+    if (isNative(fn)) { cache[name] = fn.bind(window); return cache[name]; }
+    // Not cached: the frame can be removed, so re-resolve each time.
+    var w = frameWin();
+    var alt = w ? w[name] : null;
+    return isNative(alt) ? alt.bind(w) : null;
+  }
+
+  function text(v) { return v === undefined || v === null ? '' : String(v); }
+
+  function vistaConfirm(message) {
+    var fn = native('confirm');
+    if (!fn) return false;
+    try { return fn(text(message)) === true; } catch (e) { return false; }
+  }
+
+  function vistaAlert(message) {
+    var fn = native('alert');
+    if (!fn) return undefined;
+    try { fn(text(message)); } catch (e) {}
+  }
+
+  function vistaPrompt(message, fallback) {
+    var fn = native('prompt');
+    if (!fn) return null;
+    try {
+      // Forward a default ONLY when the caller passed one: prompt(msg, undefined)
+      // renders the literal string "undefined" in the input box.
+      return arguments.length > 1 ? fn(text(message), text(fallback)) : fn(text(message));
+    } catch (e) { return null; }
+  }
+
+  function pin(name, impl) {
+    try {
+      Object.defineProperty(window, name, {
+        configurable: true,
+        enumerable: false,
+        get: function () { return impl; },
+        set: function () { /* swallow the plugin's reassignment; must not throw */ }
+      });
+    } catch (e) {
+      try { window[name] = impl; } catch (e2) {}
+    }
+  }
+
+  pin('confirm', vistaConfirm);
+  pin('alert', vistaAlert);
+  pin('prompt', vistaPrompt);
+})();"#;
+
 // ─── Vista Voice (softphone) support ────────────────────────────────
 //
 // The Phone tab hosts platform.vistainterface.com/manage/<id>/voice, which
@@ -263,8 +434,9 @@ pub fn run() {
                 // contract still works (the sidebar normally target=_blanks
                 // it into its own tab).
                 .initialization_script(format!(
-                    "{}{}",
+                    "{}{}{}",
                     desktop_marker_script(),
+                    DIALOG_GLOBALS_SCRIPT,
                     VOICE_BRIDGE_SCRIPT
                 ))
                 .on_new_window(move |url, _features| decide_new_window(&nw_app, url))
@@ -528,11 +700,13 @@ fn open_tab(app: &AppHandle, url: Url) {
     let builder = WebviewBuilder::new(label.as_str(), WebviewUrl::External(url.clone()))
         // Tabs can themselves open further tabs / auth popups / external links.
         .on_new_window(move |u, _features| decide_new_window(&nw_app, u))
-        // Mark the desktop app, bridge window.close() → sentinel nav, and
-        // give the softphone page its call-active hook.
+        // Mark the desktop app, restore the native dialog globals the dialog
+        // plugin clobbers, bridge window.close() → sentinel nav, and give the
+        // softphone page its call-active hook.
         .initialization_script(format!(
-            "{}{}{}",
+            "{}{}{}{}",
             desktop_marker_script(),
+            DIALOG_GLOBALS_SCRIPT,
             CLOSE_BRIDGE_SCRIPT,
             VOICE_BRIDGE_SCRIPT
         ))
