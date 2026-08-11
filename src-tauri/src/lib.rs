@@ -86,7 +86,7 @@ const CLOSE_BRIDGE_SCRIPT: &str = r#"(function () {
 
 // ─── Native dialog globals (confirm / alert / prompt) ───────────────
 //
-// COMPENSATES FOR: tauri-plugin-dialog 2.7.1 (pinned via Cargo.lock).
+// COMPENSATES FOR: tauri-plugin-dialog 2.x (vendored + read here at 2.7.1).
 //
 // That plugin's `init()` unconditionally injects `src/init-iife.js` on every
 // non-Android target — there is no opt-out — and that script does:
@@ -109,70 +109,139 @@ const CLOSE_BRIDGE_SCRIPT: &str = r#"(function () {
 //     webview loads a remote https:// origin, so the invoke is denied by the
 //     ACL. ~206 alert() calls display NOTHING and swallow a rejected promise.
 //
-// `prompt` is NOT touched by 2.7.1; it is pinned here purely so a future
+// `prompt` is NOT touched by 2.7.1; it is covered here purely so a future
 // plugin version can't start overriding it without us noticing.
 //
-// WHY THIS WORKS — the facts it rests on, verified in the vendored sources
-// and then MEASURED in a real Chromium (Edge 151, the same engine generation
-// as the installed WebView2 151.0.4129.72) rather than assumed:
+// ─── WHAT PRODUCTION ACTUALLY TAUGHT US ─────────────────────────────
 //
-//  * ORDERING: tauri `src/manager/webview.rs:202` pushes the plugin scripts,
-//    then :223 does
-//        all_initialization_scripts.extend(webview_attributes.initialization_scripts)
-//    i.e. OUR WebviewBuilder::initialization_script runs strictly AFTER the
-//    plugin's. (Confirmed identical in 2.11.2 and 2.11.5.) Naively caching
-//    `window.confirm` at the top of this script would therefore capture the
-//    plugin's async version and fix nothing.
-//  * WHERE THE NATIVE SURVIVES — *NOT* on `Window.prototype`. Measured: in
-//    Chromium `alert`/`confirm`/`prompt` are OWN properties of the global
-//    (writable+configurable+enumerable) and `Window.prototype` does not have
-//    them at all (`typeof Window.prototype.confirm === 'undefined'`; the whole
-//    chain is Window -> EventTarget -> EventTarget -> Object). That is the
-//    WebIDL [Global] rule: members of a [Global] interface are installed as
-//    own properties of the global object, not on the prototype. So the
-//    plugin's `window.confirm = ...` genuinely DESTROYS the only reference
-//    this realm had, and the `Object.getPrototypeOf(window)` branch in
-//    native() below never matches on this engine.
-//    => THE IFRAME BRANCH IS THE LOAD-BEARING PATH, on every call. A
-//    same-origin about:blank child frame is a fresh realm with pristine
-//    natives, and tauri injects both the plugin's script and ours with
-//    `for_main_frame_only: true` (plugin.rs:370-373 / webview/mod.rs:868-875),
-//    so neither script runs inside that frame and it stays clean. Verified
-//    over CDP: every dialog the fixed page raises reports `url: about:blank`,
-//    returns a real boolean, and honours OK vs Cancel — in BOTH injection
-//    orders. Keep the prototype branch as a cheap fast-path for engines
-//    where it does hold, but do not rely on it.
+// OBSERVED, v0.1.4 (2026-07-17) through v0.2.5: confirm fails OPEN. Reported
+// repeatedly; matches defect 1 above.
 //
-// The install uses an ACCESSOR whose setter silently swallows writes, which
-// makes the fix correct REGARDLESS of injection order: if a future tauri
-// reverses the order, the plugin's `window.confirm = ...` hits our no-op
-// setter and is discarded. A frozen data property would also block it but
-// would THROW a TypeError inside the plugin's strict-mode IIFE — a no-op
-// setter does not. `configurable: true` keeps it debuggable/replaceable.
+// OBSERVED, v0.2.6 on the owner's machine (2026-08-10), verbatim: "nothing
+// happens when I click the x. there is no pop up, the note stays." The test
+// was `if (!confirm('Delete this note? This cannot be undone.')) return`, so
+// confirm returned FALSY with no dialog — the fail-closed branch. That means
+// v0.2.6's `native('confirm')` resolved to null: BOTH of its sources failed
+// inside the real WebView2.
 //
-// Every path fails CLOSED: if no native can be resolved, confirm returns
-// false and prompt returns null, so a guard blocks rather than fails open.
+// ROOT CAUSE, established in the vendored sources (not theorised):
+//   * wry 0.55.1 `src/lib.rs:2495` documents, on `InitializationScript`:
+//       "**Windows**: scripts are always injected into subframes regardless
+//        of this option. This will be the case until Webview2 implements a
+//        proper API to inject a script only on the main frame."
+//     and `src/webview2/mod.rs:492` is literally commented "Initialize main
+//     and subframe scripts" — it loops EVERY init script through
+//     `ICoreWebView2::AddScriptToExecuteOnDocumentCreated`, which WebView2
+//     applies to every frame. `for_main_frame_only: true` is INERT on Windows.
+//   * Therefore the dialog plugin's override ALSO runs inside the
+//     same-origin about:blank child frame v0.2.6 created. isNative() correctly
+//     rejected it, native() returned null, confirm fell closed. Hypothesis (a).
+//   * The `Window.prototype` source was already known dead (WebIDL [Global]
+//     installs alert/confirm/prompt as OWN properties of the global; measured:
+//     `typeof Window.prototype.confirm === 'undefined'` in Chromium). So both
+//     of v0.2.6's sources were gone and there was nothing left.
+//   * WHY THE EDGE-151/CDP MEASUREMENT PASSED AND THE SHIP FAILED: the CDP
+//     harness injected the scripts into the MAIN FRAME ONLY (that is all
+//     Page.addScriptToEvaluateOnNewDocument did there without
+//     `includeCommandLineAPI`/frame fan-out). It never exercised wry's
+//     inject-everywhere behaviour, so it could not reproduce the pollution.
+//     A green measurement on a different injector is not a test of this one.
 //
-// ⚠️ RE-CHECK ON ANY tauri / tauri-plugin-dialog BUMP. A dependency bump
-// silently reintroducing this is the obvious regression path. Verify:
+// ─── THE MECHANISM NOW ──────────────────────────────────────────────
+//
+// Stop hunting for an unpolluted realm; there isn't one. Capture the natives
+// BEFORE the plugin can overwrite them, in this realm, and hand them forward.
+//
+//   * `DIALOG_CAPTURE_SCRIPT` ships as a tiny local Tauri plugin registered
+//     BEFORE `tauri_plugin_dialog::init()` (see run()). Verified in the
+//     vendored tauri 2.11.5 source that this ordering is real:
+//       - `Builder::plugin_boxed` (app.rs:1859) -> `PluginStore::register`
+//         (plugin.rs:879) does `self.store.push(plugin)` — a Vec, so
+//         REGISTRATION ORDER is preserved (it only `retain`s away a plugin of
+//         the SAME name; ours is unique).
+//       - `PluginStore::initialization_script` (plugin.rs:918) iterates
+//         `self.store.iter()` in that order and wraps each in
+//         `(function () { ... })();`.
+//       - `manager/webview.rs:202` extends the script list with those plugin
+//         scripts, then :223 appends `webview_attributes.initialization_scripts`
+//         — so builder scripts (DIALOG_GLOBALS_SCRIPT) still run LAST.
+//     Net order per document: [capture] ... [dialog plugin] ... [restore].
+//   * The capture script stashes the pristine, `window`-bound functions on a
+//     NON-CONFIGURABLE, NON-WRITABLE, non-enumerable own property of the
+//     global (`__VISTA_NATIVE_DIALOGS__`). A page cannot reassign or delete
+//     it, and the dialog plugin never touches it. It also immediately installs
+//     a minimal accessor over confirm/alert/prompt so the fix holds even if
+//     the restore script never runs.
+//   * `DIALOG_GLOBALS_SCRIPT` then resolves each global through LAYERED
+//     sources, best first, every one gated by isNative():
+//         stash -> own property -> Window.prototype -> about:blank frame -> null
+//     `own` catches the case where nothing overrode it at all (2.7.1 leaves
+//     `prompt` alone). `proto` and `frame` are v0.2.6's sources, kept: they
+//     cost nothing, they may hold on another engine, and the frame source now
+//     also reads the CHILD realm's own stash (which exists precisely because
+//     Windows injects into subframes).
+//   * FAIL CLOSED remains the terminal state: no native => confirm returns
+//     false, prompt returns null, alert shows nothing. The owner's report
+//     proves that branch works and is safe — a note was not deleted.
+//
+// ORDER-INDEPENDENCE (both directions are safe, deliberately):
+//   * If the capture somehow runs AFTER the plugin, it sees a non-native
+//     `confirm`, stashes nothing, and RECORDS `pre.confirm = 'overridden'` —
+//     the diagnostic then names that as the failure, instead of us guessing.
+//   * If a future tauri runs builder scripts BEFORE plugin scripts, the
+//     accessor's setter silently swallows the plugin's `window.confirm = ...`.
+//     A frozen data property would also block it but would THROW inside the
+//     plugin's strict-mode IIFE; a no-op setter does not.
+//
+// ─── SELF-DIAGNOSTIC (item 3 — no more blind shipping) ──────────────
+//
+// Every resolution is recorded on `window.__VISTA_DIALOG_DIAG__`: which source
+// satisfied each global, why each earlier source was rejected, and the last 12
+// dialog calls with their outcome. Two ways to read it WITHOUT devtools:
+//   * Ctrl+Alt+Shift+D toggles an overlay in the top frame, with a Copy button.
+//   * Any FAIL-CLOSED call auto-opens that same overlay, once per document —
+//     i.e. the next time "nothing happens when I click the x", the app says
+//     exactly which sources it tried and how each one failed.
+// Invisible in normal use: when a native resolves, nothing ever renders.
+// NO MESSAGE TEXT IS EVER RECORDED — only booleans/'string'/'shown' — so the
+// overlay cannot leak PHI from a confirm prompt.
+//
+// ⚠️ RE-CHECK ON ANY tauri / wry / tauri-plugin-dialog BUMP. Note that
+// `src-tauri/Cargo.lock` is GITIGNORED, so CI re-resolves `tauri = "2"` and
+// `tauri-plugin-dialog = "2"` on every build and the shipped versions are NOT
+// pinned by this repo. Verify:
 //   1. Does the plugin still inject init-iife.js, and does it still override
-//      confirm/alert (and now prompt)? If upstream fixed it, delete this.
+//      confirm/alert (and now prompt)? If upstream fixed it, delete all this.
 //   2. Does `generate_handler!` in the plugin's lib.rs register a real
 //      `confirm` command now?
-//   3. Is the init-script ordering in manager/webview.rs still
-//      plugins-then-builder? (If it flips, the accessor already covers us.)
-//   4. Are BOTH scripts still `for_main_frame_only: true`? If tauri or the
-//      plugin ever switches to js_init_script_on_all_frames, the plugin's
-//      override would follow us into the fallback iframe, isNative() would
-//      reject it, and every confirm would fail closed to `false` — i.e. every
-//      confirm-gated action becomes impossible to complete. Loud, not silent,
-//      but a total outage of ~165 features.
+//   3. Is `PluginStore::register` still a Vec push (registration order) and
+//      `initialization_script` still an in-order iter? If it ever becomes a
+//      map/set, the capture-runs-first guarantee is gone — the diagnostic will
+//      say `pre=overridden` and only the accessor-setter half still holds.
+//   4. Is the plugin-scripts-then-builder-scripts order in
+//      manager/webview.rs unchanged? (If it flips, the accessor covers us.)
+//   5. Does wry still inject into subframes on Windows (lib.rs:2495)? If
+//      WebView2 ever grows real main-frame-only injection, the `frame` source
+//      becomes load-bearing again and the stash becomes the redundant one.
 // NOTE: adding `dialog:allow-confirm`/`dialog:allow-ask` to the capability is
 // NOT a fix and was already tried — in 2.7.1 both are DEPRECATED ALIASES for
 // the `message` command that `dialog:default` already grants. No ACL entry can
 // authorise a command the plugin never registers.
-const DIALOG_GLOBALS_SCRIPT: &str = r#"(function () {
+
+// Name of the local capture plugin. MUST be registered before
+// tauri_plugin_dialog::init(); MUST stay unique (PluginStore::register drops
+// any earlier plugin with the same name).
+const DIALOG_CAPTURE_PLUGIN: &str = "vista-dialog-capture";
+
+// Runs FIRST in every document of every webview (including title_bar and the
+// Connect sign-in window, which get no builder script of their own — so they
+// are covered by this alone). Grabs the pristine dialog natives before the
+// dialog plugin's init-iife.js can overwrite them.
+const DIALOG_CAPTURE_SCRIPT: &str = r#"(function () {
   'use strict';
+
+  var STASH = '__VISTA_NATIVE_DIALOGS__';
+  var NAMES = ['confirm', 'alert', 'prompt'];
 
   function isNative(fn) {
     try {
@@ -181,15 +250,169 @@ const DIALOG_GLOBALS_SCRIPT: &str = r#"(function () {
     } catch (e) { return false; }
   }
 
-  // Fallback only: a same-origin about:blank frame is a fresh realm whose
-  // globals the plugin never touched (its script is main-frame-only). Kept
-  // attached and re-created if the page ever tears it out — a detached
-  // frame's dialog methods silently become no-ops.
+  // Idempotent. A document-start script can be replayed on the same document;
+  // an earlier stash is by definition the more pristine one, so never redo it.
+  try { if (window[STASH]) return; } catch (e) { return; }
+
+  var fns = {};
+  var pre = {};
+  for (var i = 0; i < NAMES.length; i++) {
+    var n = NAMES[i];
+    var raw = null;
+    try { raw = window[n]; } catch (e) { raw = null; }
+    if (isNative(raw)) {
+      pre[n] = 'native';
+      try { fns[n] = raw.bind(window); } catch (e) { pre[n] = 'bindfail'; }
+    } else if (typeof raw === 'function') {
+      // Someone already replaced it => we did NOT run first. Recorded so the
+      // diagnostic can say so out loud instead of us guessing again.
+      pre[n] = 'overridden';
+    } else {
+      pre[n] = 'missing';
+    }
+  }
+
+  var stash = { fns: fns, pre: pre };
+  try { Object.freeze(fns); Object.freeze(pre); Object.freeze(stash); } catch (e) {}
+
+  // Non-configurable + non-writable: the page cannot reassign or delete it.
+  var ok = false;
+  try {
+    Object.defineProperty(window, STASH,
+      { value: stash, writable: false, enumerable: false, configurable: false });
+    ok = true;
+  } catch (e) {}
+  if (!ok) {
+    try {
+      Object.defineProperty(window, STASH,
+        { value: stash, writable: false, enumerable: false, configurable: true });
+      ok = true;
+    } catch (e) {}
+  }
+  if (!ok) { try { window[STASH] = stash; } catch (e) {} }
+
+  // Minimal early install, so the fix holds even if DIALOG_GLOBALS_SCRIPT
+  // never runs (title bar / sign-in window) or throws. The accessor's setter
+  // swallows the dialog plugin's `window.confirm = ...` a few scripts later.
+  // enumerable:true matches the native WebIDL [Global] property it replaces.
+  function text(v) { return v === undefined || v === null ? '' : String(v); }
+
+  function pin(name, impl) {
+    try {
+      Object.defineProperty(window, name, {
+        configurable: true,
+        enumerable: true,
+        get: function () { return impl; },
+        set: function () { /* swallow the plugin's reassignment; must not throw */ }
+      });
+    } catch (e) {
+      try { window[name] = impl; } catch (e2) {}
+    }
+  }
+
+  if (fns.confirm) {
+    pin('confirm', function (m) {
+      try { return fns.confirm(text(m)) === true; } catch (e) { return false; }
+    });
+  }
+  if (fns.alert) {
+    pin('alert', function (m) {
+      try { fns.alert(text(m)); } catch (e) {}
+    });
+  }
+  if (fns.prompt) {
+    pin('prompt', function (m, d) {
+      try {
+        return arguments.length > 1 ? fns.prompt(text(m), text(d)) : fns.prompt(text(m));
+      } catch (e) { return null; }
+    });
+  }
+})();"#;
+
+// Runs LAST in content/tab webviews (WebviewBuilder::initialization_script).
+// Resolves each dialog global through the layered sources and records what it
+// found on window.__VISTA_DIALOG_DIAG__.
+const DIALOG_GLOBALS_SCRIPT: &str = r#"(function () {
+  'use strict';
+
+  var STASH = '__VISTA_NATIVE_DIALOGS__';
+  var DIAG = '__VISTA_DIALOG_DIAG__';
+  var OVERLAY_ID = '__vista_dialog_diag_overlay__';
+  var NAMES = ['confirm', 'alert', 'prompt'];
+
+  function isNative(fn) {
+    try {
+      return typeof fn === 'function' &&
+        Function.prototype.toString.call(fn).indexOf('[native code]') !== -1;
+    } catch (e) { return false; }
+  }
+
+  function text(v) { return v === undefined || v === null ? '' : String(v); }
+
+  var isTop = true;
+  try { isTop = window.top === window; } catch (e) { isTop = false; }
+
+  // ── Source 1: the pre-plugin stash (DIALOG_CAPTURE_SCRIPT) ────────
+  function fromStash(name) {
+    var s = null;
+    try { s = window[STASH]; } catch (e) { return { fn: null, why: 'throw' }; }
+    if (!s) return { fn: null, why: 'absent' };
+    var fn = null;
+    try { fn = s.fns ? s.fns[name] : null; } catch (e) {}
+    if (isNative(fn)) return { fn: fn, why: 'ok' };
+    var pre = '?';
+    try { pre = (s.pre && s.pre[name]) || '?'; } catch (e) {}
+    return { fn: null, why: 'pre=' + pre };
+  }
+
+  // ── Source 2: our own global, if nothing ever replaced it ─────────
+  // Read via the descriptor so we never invoke an accessor we installed
+  // ourselves (which would hand back a non-native wrapper).
+  function fromOwn(name) {
+    var d = null;
+    try { d = Object.getOwnPropertyDescriptor(window, name); }
+    catch (e) { return { fn: null, why: 'throw' }; }
+    if (!d) return { fn: null, why: 'absent' };
+    if (!('value' in d)) return { fn: null, why: 'accessor' };
+    if (!isNative(d.value)) return { fn: null, why: 'replaced' };
+    try { return { fn: d.value.bind(window), why: 'ok' }; }
+    catch (e) { return { fn: null, why: 'bindfail' }; }
+  }
+
+  // ── Source 3: Window.prototype ────────────────────────────────────
+  // Measured DEAD on Chromium (WebIDL [Global] => own properties, never the
+  // prototype). One property read; kept for engines that differ.
+  function fromProto(name) {
+    var fn = null;
+    try {
+      var proto = Object.getPrototypeOf(window);
+      fn = proto ? proto[name] : null;
+    } catch (e) { return { fn: null, why: 'throw' }; }
+    if (!isNative(fn)) return { fn: null, why: 'absent' };
+    try { return { fn: fn.bind(window), why: 'ok' }; }
+    catch (e) { return { fn: null, why: 'bindfail' }; }
+  }
+
+  // ── Source 4: a same-origin about:blank child realm ───────────────
+  // v0.2.6's load-bearing path; now known to be POLLUTED on Windows, because
+  // wry injects every init script into subframes there. Kept because it costs
+  // nothing and may hold elsewhere — and because that same fan-out means the
+  // child realm carries its own stash, which we prefer over its raw globals.
   var frameEl = null;
   function frameWin() {
+    // MAIN FRAME ONLY — this guard is load-bearing, do not drop it.
+    // On Windows wry fans EVERY init script into EVERY frame, so the
+    // about:blank child created below runs this very script, and its
+    // probe() would create a child of its own, and so on. Measured in
+    // Chromium: uncapped, that chain hangs the renderer synchronously on
+    // the first confirm(); depth-capped, it reached 7. The main frame is
+    // also the only frame that needs this source — on Windows a subframe
+    // already carries the capture stash, and on other platforms a subframe
+    // never receives this script at all.
+    if (!isTop) return null;
     try {
       if (frameEl && frameEl.isConnected && frameEl.contentWindow) return frameEl.contentWindow;
-      var root = document.documentElement || document.body;
+      var root = document.body || document.documentElement;
       if (!root) return null;
       frameEl = document.createElement('iframe');
       frameEl.setAttribute('aria-hidden', 'true');
@@ -201,47 +424,234 @@ const DIALOG_GLOBALS_SCRIPT: &str = r#"(function () {
     } catch (e) { return null; }
   }
 
+  function fromFrame(name) {
+    var w = frameWin();
+    if (!w) return { fn: null, why: 'nowin' };
+    try {
+      var s = w[STASH];
+      var sf = s && s.fns ? s.fns[name] : null;
+      if (isNative(sf)) return { fn: sf, why: 'ok-stash' };
+    } catch (e) {}
+    var fn = null;
+    try { fn = w[name]; } catch (e) { return { fn: null, why: 'throw' }; }
+    if (!isNative(fn)) return { fn: null, why: 'polluted' };
+    try { return { fn: fn.bind(w), why: 'ok' }; }
+    catch (e) { return { fn: null, why: 'bindfail' }; }
+  }
+
+  var SOURCES = [
+    ['stash', fromStash],
+    ['own', fromOwn],
+    ['proto', fromProto],
+    ['frame', fromFrame]
+  ];
+
+  // ── Diagnostic state ──────────────────────────────────────────────
+  var diag = {
+    app: null,
+    top: isTop,
+    url: '',
+    stash: 'absent',
+    source: { confirm: null, alert: null, prompt: null },
+    tried: { confirm: null, alert: null, prompt: null },
+    calls: []
+  };
+  try { diag.app = window.__VISTA_DESKTOP__ || null; } catch (e) {}
+  // Route SHAPE only — never the ids, never the query string. This overlay
+  // exists to be screenshotted and sent to support, and a
+  // /manage/<companyId>/clients/<clientId> path carries record identifiers
+  // that must not leave the BAA boundary. The shell has no address bar, so
+  // this overlay is the ONLY place a URL becomes visible and copyable.
+  try {
+    var path = String(location.pathname)
+      .replace(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g, ':id')
+      .replace(/\/\d{3,}/g, '/:id');
+    diag.url = (String(location.origin) + path).slice(0, 200);
+  } catch (e) {}
+  try {
+    var s0 = window[STASH];
+    diag.stash = s0 ? JSON.stringify(s0.pre) : 'absent';
+  } catch (e) {}
+
+  function record(kind, src, result) {
+    // NEVER the message text — a confirm prompt can carry PHI.
+    try {
+      if (diag.calls.length >= 12) diag.calls.shift();
+      diag.calls.push(kind + ' via ' + (src || 'NOTHING') + ' -> ' + result);
+    } catch (e) {}
+  }
+
+  // Bookkeeping must never be able to throw into a dialog call: `diag` is
+  // reachable from the page, and a frozen/booby-trapped diag object throwing
+  // out of native() would propagate through confirm() — or, worse, out of the
+  // install-time probe() and skip the pin() calls below, restoring the
+  // original fail-OPEN bug.
+  function note(name, tried, label) {
+    try {
+      diag.tried[name] = tried.join('  ');
+      diag.source[name] = label;
+    } catch (e) {}
+  }
+
   var cache = {};
   function native(name) {
     if (cache[name]) return cache[name];
-    var proto = Object.getPrototypeOf(window);
-    var fn = proto ? proto[name] : null;
-    if (isNative(fn)) { cache[name] = fn.bind(window); return cache[name]; }
-    // Not cached: the frame can be removed, so re-resolve each time.
-    var w = frameWin();
-    var alt = w ? w[name] : null;
-    return isNative(alt) ? alt.bind(w) : null;
+    var tried = [];
+    for (var i = 0; i < SOURCES.length; i++) {
+      var label = SOURCES[i][0];
+      var r;
+      try { r = SOURCES[i][1](name); } catch (e) { r = { fn: null, why: 'threw' }; }
+      tried.push(label + '=' + r.why);
+      if (r.fn) {
+        note(name, tried, label);
+        // The frame realm is re-resolved on every call: the page can rip the
+        // iframe out of the DOM, and a detached frame's dialog methods
+        // silently become no-ops. Every other source is stable, so cache it.
+        if (label !== 'frame') cache[name] = r.fn;
+        return r.fn;
+      }
+    }
+    note(name, tried, null);
+    return null;
   }
 
-  function text(v) { return v === undefined || v === null ? '' : String(v); }
-
+  // ── The globals ───────────────────────────────────────────────────
   function vistaConfirm(message) {
     var fn = native('confirm');
-    if (!fn) return false;
-    try { return fn(text(message)) === true; } catch (e) { return false; }
+    if (!fn) { record('confirm', null, 'FAIL-CLOSED (returned false)'); report(); return false; }
+    var out = false;
+    try { out = fn(text(message)) === true; } catch (e) { out = false; }
+    record('confirm', diag.source.confirm, String(out));
+    return out;
   }
 
   function vistaAlert(message) {
     var fn = native('alert');
-    if (!fn) return undefined;
+    if (!fn) { record('alert', null, 'FAIL-CLOSED (nothing shown)'); report(); return undefined; }
     try { fn(text(message)); } catch (e) {}
+    record('alert', diag.source.alert, 'shown');
+    return undefined;
   }
 
   function vistaPrompt(message, fallback) {
     var fn = native('prompt');
-    if (!fn) return null;
+    if (!fn) { record('prompt', null, 'FAIL-CLOSED (returned null)'); report(); return null; }
+    var out = null;
     try {
       // Forward a default ONLY when the caller passed one: prompt(msg, undefined)
       // renders the literal string "undefined" in the input box.
-      return arguments.length > 1 ? fn(text(message), text(fallback)) : fn(text(message));
-    } catch (e) { return null; }
+      out = arguments.length > 1 ? fn(text(message), text(fallback)) : fn(text(message));
+    } catch (e) { out = null; }
+    record('prompt', diag.source.prompt, out === null ? 'cancelled' : 'string');
+    return out;
   }
 
+  // ── Readable-without-devtools diagnostic ──────────────────────────
+  function dump() {
+    var out = [];
+    out.push('app      : ' + diag.app);
+    out.push('url      : ' + diag.url);
+    out.push('top frame: ' + diag.top);
+    out.push('capture  : ' + diag.stash);
+    for (var i = 0; i < NAMES.length; i++) {
+      var n = NAMES[i];
+      try { if (!diag.tried[n]) native(n); } catch (e) {}
+      out.push(n + ' <- ' + (diag.source[n] || 'NOTHING — fails closed'));
+      out.push('   tried: ' + diag.tried[n]);
+    }
+    out.push('calls    :');
+    if (!diag.calls.length) { out.push('   (none yet)'); }
+    for (var j = 0; j < diag.calls.length; j++) { out.push('   ' + diag.calls[j]); }
+    return out.join('\n');
+  }
+
+  function button(label, onClick) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.style.cssText = 'font:12px/1 Consolas,ui-monospace,monospace;padding:6px 10px;' +
+      'border-radius:6px;border:1px solid #55606f;background:#1c232c;color:#e7ecf3;' +
+      'cursor:pointer';
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  function show(auto) {
+    if (!isTop) return;
+    try {
+      var host = document.body || document.documentElement;
+      if (!host) return;
+      var old = document.getElementById(OVERLAY_ID);
+      if (old) {
+        if (auto) return;                                  // already up
+        try { old.parentNode.removeChild(old); } catch (e) {}
+        return;                                            // hotkey = toggle off
+      }
+      var box = document.createElement('div');
+      box.id = OVERLAY_ID;
+      box.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;' +
+        'width:560px;max-width:calc(100vw - 24px);max-height:70vh;overflow:auto;' +
+        'background:#12161c;color:#e7ecf3;border:1px solid #3a4553;border-radius:10px;' +
+        'padding:12px 14px;font:12px/1.5 Consolas,ui-monospace,monospace;' +
+        'white-space:pre-wrap;word-break:break-word;box-shadow:0 10px 40px rgba(0,0,0,.55)';
+
+      var head = document.createElement('div');
+      head.style.cssText = 'font-weight:700;margin-bottom:8px;color:' +
+        (auto ? '#ffb4a2' : '#8bd4ff');
+      head.textContent = auto
+        ? 'Vista desktop could not open a dialog — the action was BLOCKED, nothing changed.'
+        : 'Vista desktop — dialog diagnostics';
+      box.appendChild(head);
+
+      var body = document.createElement('div');
+      body.textContent = dump();
+      box.appendChild(body);
+
+      var row = document.createElement('div');
+      row.style.cssText = 'margin-top:10px;display:flex;gap:8px';
+      row.appendChild(button('Copy', function () {
+        try { navigator.clipboard.writeText(dump()); } catch (e) {}
+      }));
+      row.appendChild(button('Close', function () {
+        try { box.parentNode.removeChild(box); } catch (e) {}
+      }));
+      box.appendChild(row);
+
+      host.appendChild(box);
+    } catch (e) {}
+  }
+
+  var autoShown = false;
+  function report() {
+    if (autoShown || !isTop) return;
+    autoShown = true;
+    show(true);
+  }
+
+  function onKey(e) {
+    // Ctrl+Alt+Shift+D. Deliberately obscure; nothing renders otherwise.
+    try {
+      if (e.ctrlKey && e.altKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
+        e.preventDefault();
+        e.stopPropagation();
+        show(false);
+      }
+    } catch (err) {}
+  }
+
+  diag.dump = dump;
+  diag.show = function () { show(false); };
+  try {
+    Object.defineProperty(window, DIAG,
+      { value: diag, writable: false, enumerable: false, configurable: true });
+  } catch (e) { try { window[DIAG] = diag; } catch (e2) {} }
+
+  // ── Install ───────────────────────────────────────────────────────
   function pin(name, impl) {
     try {
       Object.defineProperty(window, name, {
         configurable: true,
-        enumerable: false,
+        enumerable: true,
         get: function () { return impl; },
         set: function () { /* swallow the plugin's reassignment; must not throw */ }
       });
@@ -250,9 +660,33 @@ const DIALOG_GLOBALS_SCRIPT: &str = r#"(function () {
     }
   }
 
+  function probe() {
+    for (var i = 0; i < NAMES.length; i++) {
+      try { if (!diag.source[NAMES[i]]) native(NAMES[i]); } catch (e) {}
+    }
+  }
+
+  // ⚠️ PROBE BEFORE PIN, ALWAYS. `fromOwn` reads window.confirm's own
+  // descriptor; pinning first would replace it with our accessor and
+  // permanently blind that source — which is exactly the source that carries
+  // us if a future plugin version stops overriding a global (2.7.1 already
+  // leaves `prompt` alone). Caught by scenario [6] of the node harness.
+  // stash/own/proto all resolve here at document-start; the frame source needs
+  // a DOM, so re-probe once the document exists. Failures are never cached, so
+  // the second pass really does retry. When the stash works no iframe is ever
+  // created — the frame source is not even reached.
+  probe();
+
   pin('confirm', vistaConfirm);
   pin('alert', vistaAlert);
   pin('prompt', vistaPrompt);
+
+  if (isTop) { try { window.addEventListener('keydown', onKey, true); } catch (e) {} }
+  try {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', probe, { once: true });
+    }
+  } catch (e) {}
 })();"#;
 
 // ─── Vista Voice (softphone) support ────────────────────────────────
@@ -362,6 +796,25 @@ fn is_auth_popup_host(host: &str) -> bool {
         || host == "signin.aws.amazon.com"
 }
 
+/// The pre-plugin dialog capture, packaged as a Tauri plugin purely to get at
+/// the plugin init-script slot — it registers no commands, no setup hook and
+/// no config, so it can never fail to initialize (TauriPlugin::initialize only
+/// deserializes `plugins.<name>` when a setup hook exists; ours has none).
+///
+/// MUST be registered before `tauri_plugin_dialog::init()`: plugin init
+/// scripts are emitted in registration order (see the DIALOG_CAPTURE_SCRIPT
+/// comment block), and this one has to see pristine natives.
+///
+/// Because it is a PLUGIN script rather than a builder script, it reaches
+/// EVERY webview automatically — content tabs, the title bar, and the managed
+/// Connect sign-in window — with no per-site wiring and no change to any
+/// existing `format!` arity.
+fn dialog_capture_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new(DIALOG_CAPTURE_PLUGIN)
+        .js_init_script(DIALOG_CAPTURE_SCRIPT)
+        .build()
+}
+
 /// Marks the page as running inside the desktop app. The web app reads
 /// `window.__VISTA_DESKTOP__` to suppress its "install the desktop app"
 /// prompt. Injected at document start into every content/tab webview.
@@ -395,6 +848,13 @@ pub fn run() {
         "--autoplay-policy=no-user-gesture-required",
     );
     tauri::Builder::default()
+        // ⚠️ ORDER IS LOAD-BEARING. This must stay the FIRST .plugin() call:
+        // plugin init scripts run in registration order, and the capture only
+        // works while window.confirm/alert/prompt are still the pristine
+        // natives — i.e. strictly before tauri_plugin_dialog::init() below
+        // injects its init-iife.js. Moving it down re-breaks every
+        // confirm-gated destructive action in the shell.
+        .plugin(dialog_capture_plugin())
         // Updater plugin: endpoint + pubkey configured in tauri.conf.json.
         // Registration alone does NOTHING in Tauri 2 — the launch check
         // lives in spawn_update_check() below. (The old `"dialog": true`
@@ -433,6 +893,13 @@ pub fn run() {
                 // itself ever lands on the softphone page, the call-active
                 // contract still works (the sidebar normally target=_blanks
                 // it into its own tab).
+                //
+                // DIALOG_CAPTURE_SCRIPT is NOT listed here — it ships as a
+                // plugin script (dialog_capture_plugin) and is prepended to
+                // every webview automatically, ahead of the dialog plugin's.
+                // desktop_marker_script() must stay FIRST: the dialog
+                // diagnostic reads window.__VISTA_DESKTOP__ for the version.
+                // 3 placeholders, 3 args.
                 .initialization_script(format!(
                     "{}{}{}",
                     desktop_marker_script(),
@@ -597,6 +1064,15 @@ fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry>
 /// Open (or focus) the managed Connect sign-in window. Closed by the
 /// agent-ready sentinel once the softphone session is live, so it can only
 /// ever exist while a sign-in is genuinely in progress.
+///
+/// DELIBERATELY gets no `initialization_script`: this window loads AWS/Cognito
+/// identity-provider pages, and we do not inject our diagnostic overlay or a
+/// keydown hook into a third party's sign-in form. Re-confirmed 2026-08-11 —
+/// and it is now moot for the actual bug, because DIALOG_CAPTURE_SCRIPT is a
+/// PLUGIN script and therefore already runs here (as it does in `title_bar`).
+/// So this window's confirm/alert are pinned to the real natives too; only the
+/// layered fallbacks and the diagnostic UI are absent. Nothing here is
+/// confirm-gated anyway.
 fn open_login_window(app: &AppHandle, url: Url) {
     if let Some(existing) = app.get_webview_window(LOGIN_WINDOW) {
         let _ = existing.set_focus();
@@ -700,9 +1176,12 @@ fn open_tab(app: &AppHandle, url: Url) {
     let builder = WebviewBuilder::new(label.as_str(), WebviewUrl::External(url.clone()))
         // Tabs can themselves open further tabs / auth popups / external links.
         .on_new_window(move |u, _features| decide_new_window(&nw_app, u))
-        // Mark the desktop app, restore the native dialog globals the dialog
-        // plugin clobbers, bridge window.close() → sentinel nav, and give the
-        // softphone page its call-active hook.
+        // Mark the desktop app, resolve the native dialog globals the dialog
+        // plugin clobbers (from the capture plugin's stash — see
+        // DIALOG_CAPTURE_SCRIPT), bridge window.close() → sentinel nav, and
+        // give the softphone page its call-active hook. desktop_marker_script()
+        // stays FIRST so the dialog diagnostic can read the app version off
+        // window.__VISTA_DESKTOP__. 4 placeholders, 4 args.
         .initialization_script(format!(
             "{}{}{}{}",
             desktop_marker_script(),
