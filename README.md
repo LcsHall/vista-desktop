@@ -1,33 +1,43 @@
 # Vista Platform — desktop app
 
-Tauri 2 shell that hosts `https://app.vistainterface.com` inside a
-borderless native window with a custom title bar, auto-updates, and
-a path to the Microsoft Store.
+Tauri 2 shell that hosts the live Vista Platform
+(`https://platform.vistainterface.com`) inside a borderless native
+window with a custom title bar and tabs, auto-updates, and a path to
+the Microsoft Store.
 
 ## Architecture
 
-One borderless window with two child webviews stacked vertically:
+One borderless window: a title-bar webview on top and one content
+webview per open TAB below it. Only the active tab is shown; the others
+stay loaded, so switching is instant. (Full detail in the header of
+`src-tauri/src/lib.rs`.)
 
 ```
-┌─────────────────────────────────────────┐
-│ ▣ Vista Platform           — □  ✕       │  ← title bar (this repo)
-├─────────────────────────────────────────┤
-│                                         │
-│   https://app.vistainterface.com        │  ← content webview
-│   (the live Vercel-deployed app)        │
-│                                         │
-└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│ ⛵ │ Platform │ POS ✕ │ Messaging ✕ │ – ☐ ✕ │  ← title bar + tabs (this repo)
+├─────────────────────────────────────────────┤
+│                                             │
+│   https://platform.vistainterface.com       │  ← active tab's content webview
+│   (the live production app, on AWS)         │
+│                                             │
+└─────────────────────────────────────────────┘
 ```
 
 - **Title bar** — HTML/CSS/JS in `/src`, served locally from the
   Tauri bundle. Drag region + Vista mark + window controls (min /
   max / close). Lives in this repo so the shell stays self-contained.
 
-- **Content** — points at production. Every Vercel deploy of
-  vista-platform updates the content for every installed desktop
-  user, instantly. The only time we ship a new desktop binary is
-  when something native changes (title bar, menus, tray, updater
-  wiring, etc.).
+- **Content** — points at production. The first tab ("Platform")
+  loads `platform.vistainterface.com` — deliberately NOT
+  `app.vistainterface.com`: sign-in happens on Interface, and only the
+  Platform-first redirect sets the cookie that hands the session back
+  to Platform afterwards (see the `PRODUCTION_URL` comment in
+  `lib.rs`). Opening POS / Messaging / any `/manage/*` page from the
+  web app spawns a new tab; genuinely external links open in the
+  system browser. Every production deploy of vista-platform (AWS)
+  updates the content for every installed desktop user, instantly.
+  The only time we ship a new desktop binary is when something
+  native changes (title bar, tabs, menus, tray, updater wiring, etc.).
 
 This split is the whole point: **content updates without app
 rebuilds**, **native chrome without coupling to web code**.
@@ -59,8 +69,9 @@ First launch downloads + compiles ~300 crates — budget ~5–10 min on
 the first run, ~30 sec on subsequent runs (Cargo caches everything).
 
 The window opens, loads the title bar, then loads
-`app.vistainterface.com`. Sign in normally; auth + cookies persist
-in WebView2's cookie store between launches.
+`platform.vistainterface.com` (which bounces to the Interface sign-in
+the first time). Sign in normally; auth + cookies persist in WebView2's
+cookie store between launches and are shared by every tab.
 
 ## Generate app icons
 
@@ -129,6 +140,8 @@ a draft GitHub Release with:
 
 Mac builds are commented out in `release.yml` until Apple signing and
 notarization are set up; without a cert the build fails every release.
+Re-enabling them is an owner decision (it adds macOS runner minutes to
+every release as well as the Apple Developer signing setup).
 
 Edit the draft, add release notes, publish. Every installed user gets
 an auto-update prompt on next launch.
@@ -180,7 +193,8 @@ going through the Store.
 │   │                                   updater endpoint, bundle targets
 │   ├── Cargo.toml                    # Rust dependencies
 │   └── build.rs                      # Tauri build-time codegen
-├── .github/workflows/release.yml     # Tag-driven multi-OS build → release
+├── .github/workflows/release.yml     # Tag-driven build → draft release
+│                                       (Windows; macOS disabled)
 ├── package.json                      # Tauri CLI + JS API deps
 ├── tsconfig.json                     # For the title-bar TS file
 └── README.md                         # You are here
@@ -209,10 +223,13 @@ going through the Store.
 
 ## Versioning
 
-Two version strings need to stay in lockstep:
+Three version strings need to stay in lockstep (same list as "Cut a
+release" above):
 - `package.json` → `"version"`
 - `src-tauri/tauri.conf.json` → `"version"`
+- `src-tauri/Cargo.toml` → `version`
 
-The release workflow uses the `tauri.conf.json` value for the bundle
-name + the GitHub Release tag. Mismatched versions don't crash but
-make release artifacts confusing.
+`scripts/check-versions.mjs` compares all three against the tag, and
+`release.yml` runs it before the Rust build — a mismatch FAILS the
+release rather than producing confusingly-named artifacts. The bundle
+name and the GitHub Release tag come from `tauri.conf.json`.
