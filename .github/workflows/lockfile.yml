@@ -38,19 +38,34 @@ jobs:
         working-directory: src-tauri
         shell: bash
         run: |
-          set -e
-          # Every Tauri-family crate v0.2.7 was built with. Plugins first
-          # (their newer releases require a newer tauri), then tauri and what
-          # it pulls, then the runtime/webview crates.
-          for spec in tauri-plugin-dialog@2.7.2 tauri-plugin-updater@2.10.1 tauri-plugin-fs@2.5.1 \
-                      tauri-plugin@2.6.3 tauri@2.11.5 tauri-runtime-wry@2.11.4 tauri-runtime@2.11.3 \
-                      tauri-utils@2.9.3 tauri-macros@2.6.3 tauri-codegen@2.6.3 tauri-build@2.6.3 \
-                      tauri-winres@0.3.6 wry@0.55.1 tao@0.35.3 muda@0.19.3 tray-icon@0.24.2 \
-                      webview2-com@0.38.2 webview2-com-sys@0.38.2 webview2-com-macros@0.8.1; do
-            name=${spec%@*}; ver=${spec#*@}
-            echo "pin $name = $ver"
-            cargo update -p "$name" --precise "$ver"
+          # Every Tauri-family crate v0.2.7 was built with. Each crate's newer
+          # release needs a newer version of another, so no single order works:
+          # retry in rounds (a pin that can't land yet is skipped this round),
+          # then require every one to be exact.
+          SPECS="tauri-plugin-dialog@2.7.2 tauri-plugin-updater@2.10.1 tauri-plugin-fs@2.5.1
+                 tauri-plugin@2.6.3 tauri@2.11.5 tauri-runtime-wry@2.11.4 tauri-runtime@2.11.3
+                 tauri-build@2.6.3 tauri-codegen@2.6.3 tauri-macros@2.6.3 tauri-utils@2.9.3
+                 tauri-winres@0.3.6 wry@0.55.1 tao@0.35.3 muda@0.19.3 tray-icon@0.24.2
+                 webview2-com@0.38.2 webview2-com-sys@0.38.2 webview2-com-macros@0.8.1"
+          locked() { awk -v n="$1" '$0=="[[package]]"{p=""} $1=="name"{p=$3} $1=="version"&&p=="\""n"\""{gsub(/"/,"",$3);print $3}' Cargo.lock; }
+          for round in 1 2 3 4 5 6 7 8; do
+            left=0
+            for spec in $SPECS; do
+              name=${spec%@*}; ver=${spec#*@}
+              if locked "$name" | grep -qx "$ver" && [ "$(locked "$name" | wc -l)" -eq 1 ]; then continue; fi
+              left=$((left+1))
+              cargo update -p "$name" --precise "$ver" >/dev/null 2>&1 || true
+            done
+            echo "round $round: $left not yet pinned"
+            [ "$left" -eq 0 ] && break
           done
+          bad=0
+          for spec in $SPECS; do
+            name=${spec%@*}; ver=${spec#*@}
+            got=$(locked "$name" | tr '\n' ' ')
+            if [ "$got" != "$ver " ]; then echo "NOT PINNED: $name wants $ver, lockfile has: $got"; bad=1; fi
+          done
+          exit $bad
 
       - name: The app compiles with exactly these versions
         working-directory: src-tauri
