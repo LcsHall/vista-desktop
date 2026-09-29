@@ -1,0 +1,47 @@
+name: Refresh Cargo.lock
+# Generates src-tauri/Cargo.lock on the same runner the release builds on,
+# proves the app compiles with it (cargo check --locked), and commits it.
+# Manual only (Actions → Refresh Cargo.lock → Run workflow, or
+# `gh workflow run lockfile.yml`). Owner-approved 2026-09-28.
+#
+# Why: Cargo.lock was gitignored, so every release re-resolved `tauri = "2"`
+# and its plugins fresh — no build was reproducible and a minor bump could
+# change behaviour with no diff. Once committed, release builds use exactly
+# these versions until this workflow is run again on purpose.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  lockfile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate the lockfile
+        working-directory: src-tauri
+        run: cargo generate-lockfile
+
+      - name: The app compiles with exactly these versions
+        working-directory: src-tauri
+        run: cargo check --locked
+
+      - name: Track Cargo.lock
+        shell: bash
+        run: |
+          sed -i '/^src-tauri\/Cargo\.lock$/d' .gitignore
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .gitignore src-tauri/Cargo.lock
+          if git diff --cached --quiet; then
+            echo "Cargo.lock unchanged — nothing to commit."
+            exit 0
+          fi
+          git commit -m "Cargo.lock: pin the Rust dependency versions (Refresh Cargo.lock workflow)"
+          git push origin HEAD:${GITHUB_REF_NAME}
