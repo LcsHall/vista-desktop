@@ -1,0 +1,61 @@
+name: Test build (no release)
+# The release build, end to end — Windows installer, updater bundle and its
+# signature with the real signing key — WITHOUT creating a release or a tag.
+# Proves the pipeline (pinned Cargo.lock, npm install, tauri build, the
+# TAURI_SIGNING_* secrets) works before a real fix needs it. Installed apps
+# never see it: nothing is published; the files are workflow artifacts only.
+# Manual: Actions → Test build (no release) → Run workflow. Added 2026-09-29.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Versions agree (same check the release runs)
+        shell: bash
+        run: node scripts/check-versions.mjs "v$(node -p "require('./package.json').version")"
+
+      - name: npm install
+        run: npm install
+
+      - name: Tauri build, signed (no release)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        # --locked: build exactly the committed Cargo.lock (fails if it would change).
+        run: npx tauri build -- --locked
+
+      - name: The updater bundle is signed
+        shell: bash
+        run: |
+          ls -la src-tauri/target/release/bundle/msi/ src-tauri/target/release/bundle/nsis/
+          sigs=$(ls src-tauri/target/release/bundle/*/*.sig 2>/dev/null | wc -l)
+          if [ "$sigs" -eq 0 ]; then echo "No .sig file: the build is NOT signed — installed apps would refuse this update."; exit 1; fi
+          echo "Signed: $sigs signature file(s)."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vista-platform-test-build
+          path: |
+            src-tauri/target/release/bundle/msi/*
+            src-tauri/target/release/bundle/nsis/*
+          retention-days: 7
