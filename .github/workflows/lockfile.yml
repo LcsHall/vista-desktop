@@ -39,9 +39,10 @@ jobs:
         shell: bash
         run: |
           set -e
-          for spec in tauri@2.11.5 tauri-runtime-wry@2.11.4 wry@0.55.1 tauri-runtime@2.11.3 \
-                      tauri-utils@2.9.3 tauri-macros@2.6.3 tauri-build@2.6.3 tao@0.35.3 \
-                      tauri-plugin-updater@2.10.1 tauri-plugin-dialog@2.7.2; do
+          # Plugins first: their newer releases require a newer tauri.
+          for spec in tauri-plugin-dialog@2.7.2 tauri-plugin-updater@2.10.1 \
+                      tauri@2.11.5 tauri-runtime-wry@2.11.4 wry@0.55.1 tauri-runtime@2.11.3 \
+                      tauri-utils@2.9.3 tauri-macros@2.6.3 tauri-build@2.6.3 tao@0.35.3; do
             name=${spec%@*}; ver=${spec#*@}
             echo "pin $name = $ver"
             cargo update -p "$name" --precise "$ver"
