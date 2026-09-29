@@ -74,7 +74,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Updater signing key. Generated once via
-          # `npm run tauri signer generate -- -w ~/.tauri/vista.key`.
+          # `npm run tauri signer generate -- -w ~/.tauri/vista-platform.key`.
           # Stored as a GitHub repo secret. Without these the build
           # still succeeds but the bundle won't include the .sig files
           # the updater needs, so users can't auto-update.

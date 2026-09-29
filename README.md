@@ -93,28 +93,30 @@ your CDN from pushing a malicious "update."
 **1. Generate the signing keypair:**
 
 ```bash
-npm run tauri signer generate -- -w ~/.tauri/vista.key
+npm run tauri signer generate -- -w ~/.tauri/vista-platform.key
 ```
 
+> **The live key (checked 2026-09-28):** `vista-platform.key` (minisign key ID `B6A6FDED515C1A2B`) — its `.pub` is exactly the `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`. Backed up in Bitwarden. The older `vista.key` was retired 2026-07-17; a release signed with any other key is refused by every installed app. Don't generate a new key unless you mean to strand every install.
+
 This emits two files:
-- `~/.tauri/vista.key` — **private key**. Keeps releases signable.
+- `~/.tauri/vista-platform.key` — **private key**. Keeps releases signable.
   **NEVER commit this.** It belongs in the GitHub Actions secret
   `TAURI_SIGNING_PRIVATE_KEY` and on your offline backup.
-- `~/.tauri/vista.key.pub` — **public key**. Goes into
+- `~/.tauri/vista-platform.key.pub` — **public key**. Goes into
   `src-tauri/tauri.conf.json` under `plugins.updater.pubkey`. Safe
   to commit; the app uses it to verify update signatures.
 
 **2. Set GitHub secrets:**
 
 In repo settings → Secrets and variables → Actions, add:
-- `TAURI_SIGNING_PRIVATE_KEY` — the contents of `~/.tauri/vista.key`
+- `TAURI_SIGNING_PRIVATE_KEY` — the contents of `~/.tauri/vista-platform.key`
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — the password you set when
   generating the key (empty if you skipped it)
 
 **3. Paste the pubkey into tauri.conf.json:**
 
 Replace `REPLACE_WITH_PUBLIC_KEY_FROM_TAURI_SIGNER_GENERATE` in
-`plugins.updater.pubkey` with the contents of `~/.tauri/vista.key.pub`
+`plugins.updater.pubkey` with the contents of `~/.tauri/vista-platform.key.pub`
 (one line).
 
 ## Cut a release
