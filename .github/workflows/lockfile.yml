@@ -28,6 +28,25 @@ jobs:
         working-directory: src-tauri
         run: cargo generate-lockfile
 
+      # Pin the Tauri stack to exactly what v0.2.7 (the installed release) was
+      # built with — read from its release log (run 31538023885). The newest
+      # tauri/wry now pull webview2-com 0.39 while lib.rs uses 0.38 directly,
+      # so a fresh resolve no longer compiles (found 2026-09-28). Moving past
+      # these is a deliberate upgrade: bump them here AND webview2-com/windows
+      # in Cargo.toml together.
+      - name: Pin the Tauri stack to the v0.2.7 build
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          set -e
+          for spec in tauri@2.11.5 tauri-runtime-wry@2.11.4 wry@0.55.1 tauri-runtime@2.11.3 \
+                      tauri-utils@2.9.3 tauri-macros@2.6.3 tauri-build@2.6.3 tao@0.35.3 \
+                      tauri-plugin-updater@2.10.1 tauri-plugin-dialog@2.7.2; do
+            name=${spec%@*}; ver=${spec#*@}
+            echo "pin $name = $ver"
+            cargo update -p "$name" --precise "$ver"
+          done
+
       - name: The app compiles with exactly these versions
         working-directory: src-tauri
         run: cargo check --locked
