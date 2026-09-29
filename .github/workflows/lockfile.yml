@@ -39,10 +39,14 @@ jobs:
         shell: bash
         run: |
           set -e
-          # Plugins first: their newer releases require a newer tauri.
-          for spec in tauri-plugin-dialog@2.7.2 tauri-plugin-updater@2.10.1 \
-                      tauri@2.11.5 tauri-runtime-wry@2.11.4 wry@0.55.1 tauri-runtime@2.11.3 \
-                      tauri-utils@2.9.3 tauri-macros@2.6.3 tauri-build@2.6.3 tao@0.35.3; do
+          # Every Tauri-family crate v0.2.7 was built with. Plugins first
+          # (their newer releases require a newer tauri), then tauri and what
+          # it pulls, then the runtime/webview crates.
+          for spec in tauri-plugin-dialog@2.7.2 tauri-plugin-updater@2.10.1 tauri-plugin-fs@2.5.1 \
+                      tauri-plugin@2.6.3 tauri@2.11.5 tauri-runtime-wry@2.11.4 tauri-runtime@2.11.3 \
+                      tauri-utils@2.9.3 tauri-macros@2.6.3 tauri-codegen@2.6.3 tauri-build@2.6.3 \
+                      tauri-winres@0.3.6 wry@0.55.1 tao@0.35.3 muda@0.19.3 tray-icon@0.24.2 \
+                      webview2-com@0.38.2 webview2-com-sys@0.38.2 webview2-com-macros@0.8.1; do
             name=${spec%@*}; ver=${spec#*@}
             echo "pin $name = $ver"
             cargo update -p "$name" --precise "$ver"
