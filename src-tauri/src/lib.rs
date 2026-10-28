@@ -1091,8 +1091,16 @@ fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry>
 /// So this window's confirm/alert are pinned to the real natives too; only the
 /// layered fallbacks and the diagnostic UI are absent. Nothing here is
 /// confirm-gated anyway.
+///
+/// An EXISTING window is re-pointed at the new URL (2026-10-28): the sign-in
+/// URL is one-time, and the old "just focus it" left a stalled, blank window
+/// swallowing every later sign-in until the app was restarted — a page
+/// refresh or "Reconnect now" could never get past "Initializing…".
 fn open_login_window(app: &AppHandle, url: Url) {
     if let Some(existing) = app.get_webview_window(LOGIN_WINDOW) {
+        if let Err(e) = existing.navigate(url) {
+            eprintln!("[vista-desktop] login window navigate failed: {e}");
+        }
         let _ = existing.set_focus();
         return;
     }
@@ -1139,6 +1147,9 @@ fn reconnect_voice(app: &AppHandle) {
         s.voice.first().cloned()
     };
     let Some(label) = voice_label else { return };
+    // A stalled sign-in window belongs to the app process, not the Phone tab —
+    // close it so the rebuilt tab's sign-in starts clean (2026-10-28).
+    close_login_window(app);
     // Capture the page URL before we tear the webview down, so we reopen the
     // same softphone page (companyId and all).
     let url = app.get_webview(&label).and_then(|wv| wv.url().ok());
