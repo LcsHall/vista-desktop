@@ -784,6 +784,24 @@ fn is_voice_url(url: &Url) -> bool {
     url.path().rsplit('/').find(|s| !s.is_empty()) == Some("voice")
 }
 
+/// "messaging" / "pos" when `url` is that /manage/<companyId>/<section> page
+/// (or below it) — the sections that get one tab each, like Phone.
+fn singleton_section(url: &Url) -> Option<&'static str> {
+    if url.host_str() != Some(PLATFORM_HOST) {
+        return None;
+    }
+    let mut segs = url.path().split('/').filter(|s| !s.is_empty());
+    if segs.next() != Some("manage") {
+        return None;
+    }
+    segs.next()?; // companyId
+    match segs.next()? {
+        "messaging" => Some("messaging"),
+        "pos" => Some("pos"),
+        _ => None,
+    }
+}
+
 /// Hosts whose popups must stay inside WebView2 (shared cookie jar) so the
 /// Connect login session lands where the CCP iframe can read it. Proven in
 /// the ccp-spike: routing these to the system browser strands the login.
@@ -1162,6 +1180,39 @@ fn open_tab(app: &AppHandle, url: Url) {
                 activate(app, &l);
                 let _ = app.emit("tab:focused", serde_json::json!({ "label": l }));
                 return;
+            }
+        }
+    }
+
+    // Dedupe Messaging / POS too (owner 10-28: every sidebar click stacked
+    // another Messaging tab through the day). Matched on the tab's CURRENT
+    // url, so a tab that navigated within its section still counts. A bare
+    // re-open just focuses the tab. A Messaging link with a target
+    // (?clientId=…) also navigates the existing tab to it — Messaging holds
+    // no unsaved work. A POS link with a target (?saleId=…) still gets its
+    // own tab so it never replaces a sale someone is ringing up.
+    if let Some(section) = singleton_section(&url) {
+        let targeted = url.query().is_some_and(|q| !q.is_empty());
+        if !(section == "pos" && targeted) {
+            let candidates = {
+                let s = app.state::<Mutex<TabState>>();
+                let s = s.lock().unwrap();
+                s.order.iter().filter(|l| *l != PLATFORM_TAB).cloned().collect::<Vec<_>>()
+            };
+            for l in candidates {
+                let Some(wv) = app.get_webview(&l) else { continue };
+                let same = wv
+                    .url()
+                    .ok()
+                    .is_some_and(|cur| singleton_section(&cur) == Some(section));
+                if same {
+                    if targeted {
+                        let _ = wv.navigate(url.clone());
+                    }
+                    activate(app, &l);
+                    let _ = app.emit("tab:focused", serde_json::json!({ "label": l }));
+                    return;
+                }
             }
         }
     }
