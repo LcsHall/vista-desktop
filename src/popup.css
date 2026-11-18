@@ -1,0 +1,98 @@
+/* Incoming-call pop-up. The whole window is the card (320 × 150 logical px). */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: #ffffff;
+  color: #111c2e;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.card {
+  height: 100%;
+  padding: 13px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px solid #dde3ee;
+}
+
+.top { display: flex; align-items: center; gap: 8px; }
+
+.pulse {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #3b82f6;
+  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.2);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25); }
+  50% { box-shadow: 0 0 0 6px rgba(59, 130, 246, 0.08); }
+}
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+
+.kicker {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #223e91;
+}
+
+.time {
+  margin-left: auto;
+  font-size: 12px;
+  color: #556076;
+  font-variant-numeric: tabular-nums;
+}
+
+.who {
+  margin-top: 3px;
+  font-size: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: #223e91;
+  background: #e8edf9;
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  vertical-align: 2px;
+}
+
+.num {
+  font-size: 13px;
+  color: #556076;
+  font-variant-numeric: tabular-nums;
+  min-height: 18px;
+}
+
+.btns { display: flex; gap: 8px; margin-top: auto; }
+
+.btn {
+  flex: 1;
+  height: 34px;
+  border: 0;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 80ms ease;
+}
+.btn:disabled { opacity: 0.6; cursor: default; }
+.btn--answer { background: #1f9d55; color: #ffffff; }
+.btn--answer:hover:not(:disabled) { background: #188548; }
+.btn--ignore { background: #eef1f6; color: #111c2e; }
+.btn--ignore:hover:not(:disabled) { background: #e2e7ef; }

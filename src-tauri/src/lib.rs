@@ -721,6 +721,32 @@ const AGENT_READY_SENTINEL: &str = "https://vista-desktop.invalid/__agent_ready_
 // only fires this when NO call is active (a re-init mid-call = ghost call), so
 // the shell can force-close + reopen the Phone tab safely.
 const RECONNECT_SENTINEL: &str = "https://vista-desktop.invalid/__reconnect_phone__";
+// Fired by the Platform tab once it knows the signed-in person has phone
+// access at this spa (owner 2026-11-18: "the phone tab opens automatically on
+// log in from the app and isn't able to be closed"). Followed by
+// /<companyId>/<userId>; the shell opens that spa's softphone page as a
+// PINNED Phone tab in the background, or replaces a Phone tab that belongs to
+// someone else.
+const PHONE_ALWAYS_ON_SENTINEL: &str = "https://vista-desktop.invalid/__phone_always_on__";
+// Fired by the Platform tab on a deliberate sign-out: the pinned Phone tab
+// leaves with the person it belongs to.
+const PHONE_SIGNED_OUT_SENTINEL: &str = "https://vista-desktop.invalid/__phone_signed_out__";
+// Fired by the Phone tab whenever this computer's call status changes, for
+// the status dot on the pinned Phone tab (owner 2026-11-18). Followed by
+// available | call | offline | connecting.
+const PHONE_STATE_SENTINEL: &str = "https://vista-desktop.invalid/__phone_state__/";
+// Fired by the Phone tab when a call starts ringing here (followed by the
+// URL-encoded JSON {contactId, name, tag, number}; sent again when the caller
+// lookup fills in the name) and when that ring is over (followed by the
+// URL-encoded contact id): the incoming-call pop-up (owner 2026-11-18).
+const CALL_RINGING_SENTINEL: &str = "https://vista-desktop.invalid/__call_ringing__/";
+const CALL_RING_OVER_SENTINEL: &str = "https://vista-desktop.invalid/__call_ring_over__/";
+// Label of the incoming-call pop-up window (local popup.html).
+const CALL_POPUP: &str = "call-popup";
+// The pop-up's size in logical pixels, and its gap from the screen corner.
+const POPUP_WIDTH: f64 = 320.0;
+const POPUP_HEIGHT: f64 = 150.0;
+const POPUP_MARGIN: f64 = 16.0;
 // NOTE: these signals use window.open(), NOT location.href. A top-level
 // navigation (even one on_navigation cancels) fires beforeunload first,
 // and the CCP iframe registers a leave-warning handler — so every call
@@ -737,6 +763,22 @@ const VOICE_BRIDGE_SCRIPT: &str = r#"(function () {
   window.__VISTA_RECONNECT_PHONE = function () {
     window.open('https://vista-desktop.invalid/__reconnect_phone__');
   };
+  window.__VISTA_PHONE_ALWAYS_ON = function (companyId, userId) {
+    window.open('https://vista-desktop.invalid/__phone_always_on__/' +
+      encodeURIComponent(companyId) + '/' + encodeURIComponent(userId));
+  };
+  window.__VISTA_PHONE_SIGNED_OUT = function () {
+    window.open('https://vista-desktop.invalid/__phone_signed_out__');
+  };
+  window.__VISTA_PHONE_STATE = function (state) {
+    window.open('https://vista-desktop.invalid/__phone_state__/' + encodeURIComponent(state));
+  };
+  window.__VISTA_CALL_RINGING = function (info) {
+    window.open('https://vista-desktop.invalid/__call_ringing__/' + encodeURIComponent(JSON.stringify(info)));
+  };
+  window.__VISTA_CALL_RING_OVER = function (contactId) {
+    window.open('https://vista-desktop.invalid/__call_ring_over__/' + encodeURIComponent(contactId));
+  };
 })();"#;
 
 // Label of the managed Connect sign-in window (Tauri-owned so the shell can
@@ -747,6 +789,10 @@ const LOGIN_WINDOW: &str = "connect-login";
 // Whether a call is live right now (armed by the voice page via the call
 // sentinel; cleared on end/destroy or when the voice tab is force-closed).
 static CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+// The call ringing on this computer right now, as the Phone tab described it
+// ({contactId, name, tag, number, startedAt}) — what the pop-up shows.
+static RINGING: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 
 /// Set the call-active flag AND (Windows) hold/release a system-sleep block so
 /// a live call can't be dropped by the machine sleeping. The power request is
@@ -851,6 +897,13 @@ struct TabState {
     /// Labels of Phone-settings tabs (deduped like voice tabs — re-opening
     /// focuses the existing one instead of stacking duplicates).
     settings: Vec<String>,
+    /// Labels of PINNED tabs (the always-on Phone tab): no ×, right after
+    /// Platform, closed only by the shell itself (sign-out, a hard reconnect,
+    /// a different person's phone, quitting the app).
+    pinned: Vec<String>,
+    /// "<companyId>/<userId>" whose phone the pinned Phone tab is, so the
+    /// next person to sign in on this computer never inherits it.
+    phone_owner: Option<String>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -953,6 +1006,8 @@ pub fn run() {
                 active: PLATFORM_TAB.to_string(),
                 voice: Vec::new(),
                 settings: Vec::new(),
+                pinned: Vec::new(),
+                phone_owner: None,
             }));
 
             // Keep the title bar + the active tab sized to the window; block
@@ -962,6 +1017,9 @@ pub fn run() {
             window.on_window_event(move |event| {
                 match event {
                     WindowEvent::Resized(_) => relayout(&resize_app),
+                    // VISTA came to the front or went behind / minimized:
+                    // the incoming-call pop-up follows (owner 2026-11-18).
+                    WindowEvent::Focused(_) => refresh_popup(&resize_app),
                     WindowEvent::CloseRequested { api, .. } => {
                         if CALL_ACTIVE.load(Ordering::SeqCst) {
                             api.prevent_close();
@@ -993,6 +1051,10 @@ pub fn run() {
             window_is_maximized,
             switch_tab,
             close_tab,
+            popup_current,
+            popup_ready,
+            popup_answer,
+            popup_ignore,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1068,6 +1130,57 @@ fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry>
             .run_on_main_thread(move || reconnect_voice(&app));
         return NewWindowResponse::Deny;
     }
+    if let Some(rest) = url.as_str().strip_prefix(PHONE_ALWAYS_ON_SENTINEL) {
+        if let Some((company, user)) = parse_phone_owner(rest) {
+            let app = app.clone();
+            let _ = app
+                .clone()
+                .run_on_main_thread(move || ensure_phone_tab(&app, company, user));
+        }
+        return NewWindowResponse::Deny;
+    }
+    if url.as_str().starts_with(PHONE_SIGNED_OUT_SENTINEL) {
+        let app = app.clone();
+        let _ = app
+            .clone()
+            .run_on_main_thread(move || close_phone_tabs(&app));
+        return NewWindowResponse::Deny;
+    }
+    if let Some(state) = url.as_str().strip_prefix(PHONE_STATE_SENTINEL) {
+        let state = percent_decode(state);
+        if matches!(state.as_str(), "available" | "call" | "offline" | "connecting") {
+            let _ = app.emit("phone:state", serde_json::json!({ "state": state }));
+        }
+        return NewWindowResponse::Deny;
+    }
+    if let Some(payload) = url.as_str().strip_prefix(CALL_RINGING_SENTINEL) {
+        if let Some(info) = parse_ringing(&percent_decode(payload)) {
+            *RINGING.lock().unwrap() = Some(info);
+            let app = app.clone();
+            let _ = app.clone().run_on_main_thread(move || refresh_popup(&app));
+        }
+        return NewWindowResponse::Deny;
+    }
+    if let Some(id) = url.as_str().strip_prefix(CALL_RING_OVER_SENTINEL) {
+        let id = percent_decode(id);
+        let cleared = {
+            let mut ringing = RINGING.lock().unwrap();
+            let same = ringing
+                .as_ref()
+                .and_then(|r| r.get("contactId"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|cur| cur == id);
+            if same {
+                *ringing = None;
+            }
+            same
+        };
+        if cleared {
+            let app = app.clone();
+            let _ = app.clone().run_on_main_thread(move || refresh_popup(&app));
+        }
+        return NewWindowResponse::Deny;
+    }
     if is_auth_popup_host(url.host_str().unwrap_or("")) {
         let app = app.clone();
         let _ = app
@@ -1121,6 +1234,252 @@ fn close_login_window(app: &AppHandle) {
     }
 }
 
+// ─── Always-on Phone tab + incoming-call pop-up (owner 2026-11-18) ──
+//
+// Mockup https://claude.ai/artifact/1u6edSf3cPkBbsBXjaTLHh, approved with:
+// only people with phone access get the pinned tab (the web app decides and
+// sends PHONE_ALWAYS_ON); a status dot on it; a pop-up in the screen corner
+// while a call rings here and the Phone tab isn't in front, whose Ignore
+// passes the call on (the page's Decline path).
+
+/// Decode %XX escapes as UTF-8. Sentinel payloads are encodeURIComponent'd by
+/// the page; a malformed escape is kept as written.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            let byte = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(b) = byte {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A VISTA id as the web app writes it: 36 characters of hex digits and dashes.
+fn is_vista_id(s: &str) -> bool {
+    s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// "/<companyId>/<userId>" (each URL-encoded) → the two ids, lower-cased.
+fn parse_phone_owner(rest: &str) -> Option<(String, String)> {
+    let mut parts = rest.split('/').filter(|p| !p.is_empty()).map(percent_decode);
+    let company = parts.next()?;
+    let user = parts.next()?;
+    if parts.next().is_some() || !is_vista_id(&company) || !is_vista_id(&user) {
+        return None;
+    }
+    Some((company.to_ascii_lowercase(), user.to_ascii_lowercase()))
+}
+
+/// The Phone tab's ringing payload, trimmed to what the pop-up shows.
+fn parse_ringing(json: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let contact_id = v.get("contactId")?.as_str()?.trim().to_string();
+    if contact_id.is_empty() || contact_id.len() > 64 {
+        return None;
+    }
+    let text = |key: &str, max: usize| -> serde_json::Value {
+        match v.get(key).and_then(|x| x.as_str()).map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::Value::String(s.chars().take(max).collect()),
+            _ => serde_json::Value::Null,
+        }
+    };
+    let started_at = v.get("startedAt").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    Some(serde_json::json!({
+        "contactId": contact_id,
+        "name": text("name", 80),
+        "tag": text("tag", 24),
+        "number": text("number", 32),
+        "startedAt": started_at,
+    }))
+}
+
+/// Open (or keep) the pinned, always-on Phone tab for `company`/`user`. It
+/// opens in the background (the person stays where they are), right after
+/// Platform, with no ×. A Phone tab opened earlier from the sidebar for the
+/// same spa is adopted as the pinned one; a Phone tab that belongs to someone
+/// else (another person signed in on this computer, or another spa) is
+/// replaced, never during a live call (the next page load asks again). Runs
+/// on the main thread.
+fn ensure_phone_tab(app: &AppHandle, company: String, user: String) {
+    let owner = format!("{company}/{user}");
+    let Ok(url) = format!("https://{PLATFORM_HOST}/manage/{company}/voice").parse::<Url>() else {
+        return;
+    };
+    let (existing, current_owner) = {
+        let s = app.state::<Mutex<TabState>>();
+        let s = s.lock().unwrap();
+        (s.voice.first().cloned(), s.phone_owner.clone())
+    };
+    let Some(label) = existing else {
+        open_tab_ex(app, url, true, Some(owner));
+        return;
+    };
+    let spa_prefix = format!("/manage/{company}/");
+    let same_spa = app
+        .get_webview(&label)
+        .and_then(|wv| wv.url().ok())
+        .is_some_and(|cur| cur.path().to_ascii_lowercase().starts_with(&spa_prefix));
+    let same_person = current_owner.as_deref().map_or(true, |o| o == owner);
+    if same_spa && same_person {
+        pin_tab(app, &label, owner);
+        return;
+    }
+    if CALL_ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    close_tab_impl(app, &label, true);
+    // Let the old phone's teardown (frame removal, then the deferred webview
+    // drop) finish before the new one starts, as reconnect_voice does.
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let a = app2.clone();
+        let _ = app2.run_on_main_thread(move || open_tab_ex(&a, url, true, Some(owner)));
+    });
+}
+
+/// Make `label` the pinned Phone tab: right after Platform, no ×, owned by
+/// `owner`. Tells the title bar. Runs on the main thread.
+fn pin_tab(app: &AppHandle, label: &str, owner: String) {
+    let index = {
+        let s = app.state::<Mutex<TabState>>();
+        let mut s = s.lock().unwrap();
+        if !s.pinned.iter().any(|l| l == label) {
+            s.pinned.push(label.to_string());
+        }
+        s.phone_owner = Some(owner);
+        if let Some(i) = s.order.iter().position(|l| l == label) {
+            let moved = s.order.remove(i);
+            let at = 1.min(s.order.len());
+            s.order.insert(at, moved);
+        }
+        s.order.iter().position(|l| l == label).unwrap_or(1)
+    };
+    let _ = app.emit("tab:pinned", serde_json::json!({ "label": label, "index": index }));
+}
+
+/// Sign-out: close every Phone tab (the pinned one leaves with its person)
+/// and the pop-up. A live call is never hung up: the tab stays until it ends,
+/// and the next person's sign-in replaces it then. Runs on the main thread.
+fn close_phone_tabs(app: &AppHandle) {
+    if CALL_ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    let labels = {
+        let s = app.state::<Mutex<TabState>>();
+        let mut s = s.lock().unwrap();
+        s.phone_owner = None;
+        s.voice.clone()
+    };
+    for label in labels {
+        close_tab_impl(app, &label, true);
+    }
+    *RINGING.lock().unwrap() = None;
+    hide_popup(app);
+}
+
+/// Show, update or hide the incoming-call pop-up to match what rings here.
+/// Shown while a call rings unless VISTA is in front with the Phone tab
+/// showing (its own caller card is enough then). Runs on the main thread.
+fn refresh_popup(app: &AppHandle) {
+    let ringing = RINGING.lock().unwrap().clone();
+    let Some(info) = ringing else {
+        hide_popup(app);
+        return;
+    };
+    let phone_tab_active = {
+        let s = app.state::<Mutex<TabState>>();
+        let s = s.lock().unwrap();
+        s.voice.iter().any(|v| *v == s.active)
+    };
+    let window_in_front = app.get_window("main").is_some_and(|w| {
+        w.is_focused().unwrap_or(false) && !w.is_minimized().unwrap_or(false)
+    });
+    if phone_tab_active && window_in_front {
+        hide_popup(app);
+    } else {
+        show_popup(app, info);
+    }
+}
+
+/// Fill and show the pop-up, creating it on first use. A new window stays
+/// hidden until popup.html has drawn the call (popup_ready), so no empty card
+/// flashes up. It can never take focus: someone typing keeps typing.
+fn show_popup(app: &AppHandle, info: serde_json::Value) {
+    if let Some(w) = app.get_webview_window(CALL_POPUP) {
+        let _ = app.emit_to(CALL_POPUP, "popup:show", info);
+        place_popup(app, &w);
+        let _ = w.show();
+        return;
+    }
+    let built = tauri::WebviewWindowBuilder::new(app, CALL_POPUP, WebviewUrl::App("popup.html".into()))
+        .title("Incoming call")
+        .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
+        .decorations(false)
+        .resizable(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .focusable(false)
+        .visible(false)
+        .shadow(true)
+        .build();
+    match built {
+        Ok(w) => place_popup(app, &w),
+        Err(e) => eprintln!("[vista-desktop] failed to open the call pop-up: {e}"),
+    }
+}
+
+/// Bottom-right corner of the screen VISTA is on, above the taskbar.
+fn place_popup(app: &AppHandle, popup: &tauri::WebviewWindow) {
+    let monitor = app
+        .get_window("main")
+        .and_then(|w| w.current_monitor().ok().flatten())
+        .or_else(|| popup.primary_monitor().ok().flatten());
+    let Some(m) = monitor else { return };
+    let scale = m.scale_factor();
+    let area = m.work_area();
+    let w = (POPUP_WIDTH * scale).round() as i32;
+    let h = (POPUP_HEIGHT * scale).round() as i32;
+    let margin = (POPUP_MARGIN * scale).round() as i32;
+    let x = area.position.x + area.size.width as i32 - w - margin;
+    let y = area.position.y + area.size.height as i32 - h - margin;
+    let _ = popup.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+fn hide_popup(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window(CALL_POPUP) {
+        let _ = w.hide();
+    }
+}
+
+/// Call one of the Phone page's hooks with a contact id (JSON-quoted, so the
+/// id can never break out of the string).
+fn call_phone_page(app: &AppHandle, label: &str, hook: &str, contact_id: &str) {
+    let Some(wv) = app.get_webview(label) else { return };
+    let arg = serde_json::Value::String(contact_id.to_string()).to_string();
+    let script = format!("try{{window.{hook}&&window.{hook}({arg})}}catch(e){{}}");
+    let _ = wv.eval(&script);
+}
+
+/// The first Phone tab's label, if one is open.
+fn phone_tab_label(app: &AppHandle) -> Option<String> {
+    let s = app.state::<Mutex<TabState>>();
+    let s = s.lock().unwrap();
+    s.voice.first().cloned()
+}
+
 /// Open an internal /manage/* page as a tab, anything else in the system
 /// browser. Window/webview mutations are deferred to the main thread to
 /// avoid reentrancy while the webview engine is mid new-window-request.
@@ -1141,10 +1500,16 @@ fn route_new_window(app: &AppHandle, url: Url) {
 /// webview clears the wedged CCP shared worker a page reload can't. Runs on the
 /// main thread.
 fn reconnect_voice(app: &AppHandle) {
-    let voice_label = {
+    // The rebuilt tab keeps its place: pinned (same owner) and in the
+    // background unless the person was looking at it (owner 2026-11-18).
+    let (voice_label, was_active, pinned_owner) = {
         let s = app.state::<Mutex<TabState>>();
         let s = s.lock().unwrap();
-        s.voice.first().cloned()
+        let label = s.voice.first().cloned();
+        let was_active = label.as_deref().is_some_and(|l| l == s.active);
+        let pinned = label.as_deref().is_some_and(|l| s.pinned.iter().any(|p| p == l));
+        let owner = if pinned { s.phone_owner.clone() } else { None };
+        (label, was_active, owner)
     };
     let Some(label) = voice_label else { return };
     // A stalled sign-in window belongs to the app process, not the Phone tab —
@@ -1162,7 +1527,7 @@ fn reconnect_voice(app: &AppHandle) {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(900));
             let a = app2.clone();
-            let _ = app2.run_on_main_thread(move || open_tab(&a, url));
+            let _ = app2.run_on_main_thread(move || open_tab_ex(&a, url, !was_active, pinned_owner));
         });
     }
 }
@@ -1170,6 +1535,14 @@ fn reconnect_voice(app: &AppHandle) {
 /// Add a new content webview as a tab, make it active, and tell the
 /// title bar to render it. Runs on the main thread.
 fn open_tab(app: &AppHandle, url: Url) {
+    open_tab_ex(app, url, false, None);
+}
+
+/// `open_tab`, plus: `background` keeps the person on the tab they're on (the
+/// new tab is laid out behind it), and `pin_owner` makes the tab the pinned,
+/// always-on Phone tab owned by "<companyId>/<userId>". Phone tabs always sit
+/// right after Platform. Runs on the main thread.
+fn open_tab_ex(app: &AppHandle, url: Url, background: bool, pin_owner: Option<String>) {
     let window = match app.get_window("main") {
         Some(w) => w,
         None => return,
@@ -1188,8 +1561,13 @@ fn open_tab(app: &AppHandle, url: Url) {
         };
         for l in candidates {
             if app.get_webview(&l).is_some() {
-                activate(app, &l);
-                let _ = app.emit("tab:focused", serde_json::json!({ "label": l }));
+                if let (Some(owner), false) = (pin_owner.clone(), is_settings_url) {
+                    pin_tab(app, &l, owner);
+                }
+                if !background {
+                    activate(app, &l);
+                    let _ = app.emit("tab:focused", serde_json::json!({ "label": l }));
+                }
                 return;
             }
         }
@@ -1282,22 +1660,45 @@ fn open_tab(app: &AppHandle, url: Url) {
     #[cfg(windows)]
     attach_mic_handler(app, &label);
 
-    {
+    let is_voice = is_voice_url(&url);
+    let pinned = is_voice && pin_owner.is_some();
+    let (index, current_active) = {
         let state = app.state::<Mutex<TabState>>();
         let mut s = state.lock().unwrap();
-        s.order.push(label.clone());
-        if is_voice_url(&url) {
+        // Phone sits right after Platform (owner 2026-11-18); others append.
+        let index = if is_voice { 1.min(s.order.len()) } else { s.order.len() };
+        s.order.insert(index, label.clone());
+        if is_voice {
             s.voice.push(label.clone());
         } else if is_settings_url {
             s.settings.push(label.clone());
         }
+        if pinned {
+            s.pinned.push(label.clone());
+            s.phone_owner = pin_owner.clone();
+        }
+        (index, s.active.clone())
+    };
+    if background {
+        // Re-lay out around the tab the person is on: the new Phone tab is
+        // parked off-screen (voice tabs are never hidden) behind theirs.
+        activate(app, &current_active);
+    } else {
+        // Show the new tab, hide the rest, mark it active.
+        activate(app, &label);
     }
-    // Show the new tab, hide the rest, mark it active.
-    activate(app, &label);
 
     let _ = app.emit(
         "tab:opened",
-        serde_json::json!({ "label": label, "title": tab_title(&url) }),
+        serde_json::json!({
+            "label": label,
+            "title": tab_title(&url),
+            "index": index,
+            "closeable": !pinned,
+            "pinned": pinned,
+            "phone": is_voice,
+            "background": background,
+        }),
     );
 }
 
@@ -1339,6 +1740,8 @@ fn activate(app: &AppHandle, label: &str) {
         }
     }
     app.state::<Mutex<TabState>>().lock().unwrap().active = label.to_string();
+    // Switching to (or away from) the Phone tab hides (or shows) the pop-up.
+    refresh_popup(app);
 }
 
 /// Close a tab: drop its webview, re-activate a neighbor if it was the
@@ -1350,11 +1753,20 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
     if label == PLATFORM_TAB {
         return;
     }
-    let is_voice = {
+    let (is_voice, is_pinned) = {
         let state = app.state::<Mutex<TabState>>();
         let s = state.lock().unwrap();
-        s.voice.iter().any(|v| v == label)
+        (
+            s.voice.iter().any(|v| v == label),
+            s.pinned.iter().any(|v| v == label),
+        )
     };
+    // The pinned Phone tab has no ×, and a page's window.close() can't close
+    // it either: only the shell does (sign-out, a hard reconnect, another
+    // person's phone), with `force` (owner 2026-11-18).
+    if is_pinned && !force {
+        return;
+    }
     if is_voice && !force && CALL_ACTIVE.load(Ordering::SeqCst) {
         let _ = app.emit(
             "call:close-blocked",
@@ -1370,6 +1782,7 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
         }
         s.voice.retain(|v| v != label);
         s.settings.retain(|v| v != label);
+        s.pinned.retain(|v| v != label);
         // The page that armed the call flag is going away — clear it so a
         // stale flag can't block closes forever.
         if is_voice {
@@ -1415,6 +1828,11 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
         } else {
             let _ = wv.close();
         }
+    }
+    if is_voice {
+        // The page that announced a ring is gone, and so is its pop-up.
+        *RINGING.lock().unwrap() = None;
+        hide_popup(app);
     }
     if let Some(next) = &reactivate {
         activate(app, next);
@@ -1494,6 +1912,61 @@ fn close_tab(app: AppHandle, label: String, force: Option<bool>) {
     let _ = app
         .clone()
         .run_on_main_thread(move || close_tab_impl(&app, &label, force));
+}
+
+// Invoked from the incoming-call pop-up (popup.html, local origin).
+
+/// The call the pop-up should show (asked once popup.html has loaded).
+#[tauri::command]
+fn popup_current() -> Option<serde_json::Value> {
+    RINGING.lock().unwrap().clone()
+}
+
+/// popup.html has drawn the call: show the window now, unless the ring ended
+/// or the Phone tab came to the front meanwhile.
+#[tauri::command]
+fn popup_ready(app: AppHandle) {
+    let _ = app.clone().run_on_main_thread(move || refresh_popup(&app));
+}
+
+/// Pop-up "Answer": bring VISTA to the front on the Phone tab and pick up.
+#[tauri::command]
+fn popup_answer(app: AppHandle, contact_id: String) {
+    let _ = app.clone().run_on_main_thread(move || {
+        hide_popup(&app);
+        let Some(label) = phone_tab_label(&app) else { return };
+        if let Some(main) = app.get_window("main") {
+            let _ = main.unminimize();
+            let _ = main.show();
+            let _ = main.set_focus();
+        }
+        activate(&app, &label);
+        let _ = app.emit("tab:focused", serde_json::json!({ "label": label }));
+        call_phone_page(&app, &label, "__VISTA_ANSWER_CALL", &contact_id);
+    });
+}
+
+/// Pop-up "Ignore": stop ringing here for this one call and pass it on, the
+/// same as Decline (owner 2026-11-18). The next call still pops up.
+#[tauri::command]
+fn popup_ignore(app: AppHandle, contact_id: String) {
+    let _ = app.clone().run_on_main_thread(move || {
+        {
+            let mut ringing = RINGING.lock().unwrap();
+            let same = ringing
+                .as_ref()
+                .and_then(|r| r.get("contactId"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|cur| cur == contact_id);
+            if same {
+                *ringing = None;
+            }
+        }
+        hide_popup(&app);
+        if let Some(label) = phone_tab_label(&app) {
+            call_phone_page(&app, &label, "__VISTA_IGNORE_CALL", &contact_id);
+        }
+    });
 }
 
 #[tauri::command]

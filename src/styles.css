@@ -99,6 +99,20 @@ html, body {
 /* Pages with no ✕ (the Platform tab) shouldn't reserve the close slot. */
 .titlebar__tab--fixed { padding-right: 13px; }
 
+/* Status dot on the pinned Phone tab (owner 2026-11-18): is this computer
+   taking calls? Readable on both the navy bar and the active tab fill. */
+.titlebar__dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: -1px;
+}
+.titlebar__dot--available { background: #4ade80; }
+.titlebar__dot--call { background: #60a5fa; }
+.titlebar__dot--offline { background: #94a3b8; }
+.titlebar__dot--connecting { background: #fbbf24; }
+
 .titlebar__tab-label {
   overflow: hidden;
   text-overflow: ellipsis;

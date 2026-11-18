@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "call-popup",
+  "description": "The incoming-call pop-up (local popup.html): reads the ringing call and sends Answer / Ignore back to the shell. Nothing else.",
+  "windows": ["call-popup"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen"
+  ]
+}

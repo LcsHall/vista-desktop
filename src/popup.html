@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Incoming call</title>
+<link rel="stylesheet" href="./popup.css">
+</head>
+<body>
+  <!--
+    Incoming-call pop-up (owner-approved 2026-11-18,
+    https://claude.ai/artifact/1u6edSf3cPkBbsBXjaTLHh). Shown by the shell in
+    the screen corner while a call rings on this computer and the Phone tab
+    isn't in front. The window can never take focus, so these buttons are
+    clicked, never typed into.
+  -->
+  <div class="card" role="alertdialog" aria-live="assertive" aria-labelledby="kicker caller">
+    <div class="top">
+      <span class="pulse" aria-hidden="true"></span>
+      <span class="kicker" id="kicker">Incoming call</span>
+      <span class="time" id="time" aria-hidden="true">0:00</span>
+    </div>
+    <div class="who" id="caller"><span id="name">Unknown caller</span><span class="tag" id="tag" hidden></span></div>
+    <div class="num" id="num"></div>
+    <div class="btns">
+      <button type="button" class="btn btn--answer" id="answer">Answer</button>
+      <button type="button" class="btn btn--ignore" id="ignore">Ignore</button>
+    </div>
+  </div>
+  <script type="module" src="./popup.js"></script>
+</body>
+</html>

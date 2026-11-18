@@ -25,6 +25,18 @@ const tabsEl = $('tabs');
 let tabs = [{ label: 'content', title: 'Platform', closeable: false }];
 let active = 'content';
 
+// The Phone tab's status dot (owner 2026-11-18): the Phone page reports
+// available | call | offline | connecting through the shell.
+let phoneState = null;
+const PHONE_STATE_WORDS = {
+  available: 'taking calls',
+  call: 'on a call',
+  offline: 'not taking calls',
+  connecting: 'connecting',
+};
+const PINNED_PHONE_TIP =
+  'Phone stays open so calls can always ring. To stop taking calls, set yourself to Offline in the Phone tab.';
+
 function renderTabs() {
   tabsEl.replaceChildren();
   for (const tab of tabs) {
@@ -34,7 +46,15 @@ function renderTabs() {
       (tab.closeable ? '' : ' titlebar__tab--fixed');
     el.setAttribute('role', 'tab');
     el.setAttribute('tabindex', '0');
-    el.title = tab.title;
+    el.title = tab.pinned ? PINNED_PHONE_TIP : tab.title;
+
+    if (tab.phone && tab.pinned && phoneState && PHONE_STATE_WORDS[phoneState]) {
+      const dot = document.createElement('span');
+      dot.className = `titlebar__dot titlebar__dot--${phoneState}`;
+      dot.setAttribute('aria-hidden', 'true');
+      el.appendChild(dot);
+      el.setAttribute('aria-label', `${tab.title}, ${PHONE_STATE_WORDS[phoneState]}`);
+    }
 
     const label = document.createElement('span');
     label.className = 'titlebar__tab-label';
@@ -78,14 +98,46 @@ function selectTab(label) {
   invoke('switch_tab', { label }).catch(console.error);
 }
 
-// Rust opened a new tab (POS / Messaging / any /manage/* page).
+// Rust opened a new tab (POS / Messaging / any /manage/* page). Phone tabs
+// arrive with an index (right after Platform); the always-on Phone tab
+// arrives pinned (no ×) and in the background (the person stays put).
 listen('tab:opened', (e) => {
-  const { label, title } = e.payload || {};
+  const { label, title, index, closeable, pinned, phone, background } = e.payload || {};
   if (!label) return;
   if (!tabs.some((t) => t.label === label)) {
-    tabs.push({ label, title: title || 'Page', closeable: true });
+    const tab = {
+      label,
+      title: title || 'Page',
+      closeable: closeable !== false,
+      pinned: !!pinned,
+      phone: !!phone,
+    };
+    const at = Number.isInteger(index) ? Math.max(1, Math.min(index, tabs.length)) : tabs.length;
+    tabs.splice(at, 0, tab);
   }
-  active = label;
+  if (!background) active = label;
+  renderTabs();
+}).catch(console.error);
+
+// Rust made an open Phone tab the pinned, always-on one.
+listen('tab:pinned', (e) => {
+  const { label, index } = e.payload || {};
+  const i = tabs.findIndex((t) => t.label === label);
+  if (i < 0) return;
+  const [tab] = tabs.splice(i, 1);
+  tab.pinned = true;
+  tab.closeable = false;
+  tab.phone = true;
+  const at = Number.isInteger(index) ? Math.max(1, Math.min(index, tabs.length)) : 1;
+  tabs.splice(at, 0, tab);
+  renderTabs();
+}).catch(console.error);
+
+// The Phone page reported this computer's call status (the dot).
+listen('phone:state', (e) => {
+  const { state } = e.payload || {};
+  if (!PHONE_STATE_WORDS[state] || state === phoneState) return;
+  phoneState = state;
   renderTabs();
 }).catch(console.error);
 
@@ -101,6 +153,8 @@ listen('tab:focused', (e) => {
 // Rust closed a tab (via the ✕, or a page's own window.close()).
 listen('tab:closed', (e) => {
   const { label, active: nextActive } = e.payload || {};
+  // A closed Phone tab's status is gone with it; a rebuilt one reports anew.
+  if (tabs.some((t) => t.label === label && t.phone)) phoneState = null;
   tabs = tabs.filter((t) => t.label !== label);
   if (nextActive) active = nextActive;
   renderTabs();
