@@ -1013,7 +1013,10 @@ fn dialog_capture_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 /// `window.__VISTA_DESKTOP__` to suppress its "install the desktop app"
 /// prompt. Injected at document start into every content/tab webview.
 fn desktop_marker_script() -> String {
-    format!("window.__VISTA_DESKTOP__ = '{}';", env!("CARGO_PKG_VERSION"))
+    format!(
+        "window.__VISTA_DESKTOP__ = '{}';",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 // Ordered list of open tabs (by webview label) + which one is showing.
@@ -1429,8 +1432,12 @@ fn spawn_update_check(app: &tauri::AppHandle) {
 
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let Ok(updater) = handle.updater() else { return };
-        let Ok(Some(update)) = updater.check().await else { return };
+        let Ok(updater) = handle.updater() else {
+            return;
+        };
+        let Ok(Some(update)) = updater.check().await else {
+            return;
+        };
         let version = update.version.clone();
         let restart_handle = handle.clone();
         handle
@@ -1518,7 +1525,10 @@ fn decide_new_window(app: &AppHandle, from: &str, url: Url) -> NewWindowResponse
     }
     if let Some(state) = url.as_str().strip_prefix(PHONE_STATE_SENTINEL) {
         let state = percent_decode(state);
-        if matches!(state.as_str(), "available" | "call" | "offline" | "connecting") {
+        if matches!(
+            state.as_str(),
+            "available" | "call" | "offline" | "connecting"
+        ) {
             let _ = app.emit("phone:state", serde_json::json!({ "state": state }));
         }
         return NewWindowResponse::Deny;
@@ -1772,7 +1782,10 @@ fn is_vista_id(s: &str) -> bool {
 
 /// "/<companyId>/<userId>" (each URL-encoded) → the two ids, lower-cased.
 fn parse_phone_owner(rest: &str) -> Option<(String, String)> {
-    let mut parts = rest.split('/').filter(|p| !p.is_empty()).map(percent_decode);
+    let mut parts = rest
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .map(percent_decode);
     let company = parts.next()?;
     let user = parts.next()?;
     if parts.next().is_some() || !is_vista_id(&company) || !is_vista_id(&user) {
@@ -1830,7 +1843,7 @@ fn ensure_phone_tab(app: &AppHandle, company: String, user: String) {
         .get_webview(&label)
         .and_then(|wv| wv.url().ok())
         .is_some_and(|cur| cur.path().to_ascii_lowercase().starts_with(&spa_prefix));
-    let same_person = current_owner.as_deref().map_or(true, |o| o == owner);
+    let same_person = current_owner.as_deref().is_none_or(|o| o == owner);
     if same_spa && same_person {
         pin_tab(app, &label, owner);
         return;
@@ -1866,7 +1879,10 @@ fn pin_tab(app: &AppHandle, label: &str, owner: String) {
         }
         s.order.iter().position(|l| l == label).unwrap_or(1)
     };
-    let _ = app.emit("tab:pinned", serde_json::json!({ "label": label, "index": index }));
+    let _ = app.emit(
+        "tab:pinned",
+        serde_json::json!({ "label": label, "index": index }),
+    );
 }
 
 /// Sign-out: close every Phone tab (the pinned one leaves with its person)
@@ -1903,9 +1919,9 @@ fn refresh_popup(app: &AppHandle) {
         let s = s.lock().unwrap();
         s.voice.iter().any(|v| *v == s.active)
     };
-    let window_in_front = app.get_window("main").is_some_and(|w| {
-        w.is_focused().unwrap_or(false) && !w.is_minimized().unwrap_or(false)
-    });
+    let window_in_front = app
+        .get_window("main")
+        .is_some_and(|w| w.is_focused().unwrap_or(false) && !w.is_minimized().unwrap_or(false));
     if phone_tab_active && window_in_front {
         hide_popup(app);
     } else {
@@ -1939,18 +1955,19 @@ fn create_popup(app: &AppHandle) {
     {
         return;
     }
-    let built = tauri::WebviewWindowBuilder::new(app, CALL_POPUP, WebviewUrl::App("popup.html".into()))
-        .title("Incoming call")
-        .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
-        .decorations(false)
-        .resizable(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .focusable(false)
-        .visible(false)
-        .shadow(true)
-        .build();
+    let built =
+        tauri::WebviewWindowBuilder::new(app, CALL_POPUP, WebviewUrl::App("popup.html".into()))
+            .title("Incoming call")
+            .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
+            .decorations(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .focused(false)
+            .focusable(false)
+            .visible(false)
+            .shadow(true)
+            .build();
     match built {
         Ok(w) => place_popup(app, &w),
         Err(e) => eprintln!("[vista-desktop] failed to open the call pop-up: {e}"),
@@ -1983,7 +2000,9 @@ fn hide_popup(app: &AppHandle) {
 /// Call one of the Phone page's hooks with a contact id (JSON-quoted, so the
 /// id can never break out of the string).
 fn call_phone_page(app: &AppHandle, label: &str, hook: &str, contact_id: &str) {
-    let Some(wv) = app.get_webview(label) else { return };
+    let Some(wv) = app.get_webview(label) else {
+        return;
+    };
     let arg = serde_json::Value::String(contact_id.to_string()).to_string();
     let script = format!("try{{window.{hook}&&window.{hook}({arg})}}catch(e){{}}");
     let _ = wv.eval(&script);
@@ -2022,7 +2041,9 @@ fn reconnect_voice(app: &AppHandle) {
         let s = s.lock().unwrap();
         let label = s.voice.first().cloned();
         let was_active = label.as_deref().is_some_and(|l| l == s.active);
-        let pinned = label.as_deref().is_some_and(|l| s.pinned.iter().any(|p| p == l));
+        let pinned = label
+            .as_deref()
+            .is_some_and(|l| s.pinned.iter().any(|p| p == l));
         let owner = if pinned { s.phone_owner.clone() } else { None };
         (label, was_active, owner)
     };
@@ -2042,7 +2063,8 @@ fn reconnect_voice(app: &AppHandle) {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(900));
             let a = app2.clone();
-            let _ = app2.run_on_main_thread(move || open_tab_ex(&a, url, !was_active, pinned_owner));
+            let _ =
+                app2.run_on_main_thread(move || open_tab_ex(&a, url, !was_active, pinned_owner));
         });
     }
 }
@@ -2071,13 +2093,16 @@ fn open_tab_ex(app: &AppHandle, url: Url, background: bool, pin_owner: Option<St
     // Dedupe the singleton tabs: re-opening Phone or Phone settings (sidebar
     // re-click, click-to-call fallback) FOCUSES the existing tab instead of
     // stacking a duplicate — two live CCPs would be two competing softphones.
-    let is_settings_url =
-        url.path().rsplit('/').find(|s| !s.is_empty()) == Some("voice-settings");
+    let is_settings_url = url.path().rsplit('/').find(|s| !s.is_empty()) == Some("voice-settings");
     if is_voice_url(&url) || is_settings_url {
         let candidates = {
             let s = app.state::<Mutex<TabState>>();
             let s = s.lock().unwrap();
-            if is_settings_url { s.settings.clone() } else { s.voice.clone() }
+            if is_settings_url {
+                s.settings.clone()
+            } else {
+                s.voice.clone()
+            }
         };
         for l in candidates {
             if app.get_webview(&l).is_some() {
@@ -2106,10 +2131,16 @@ fn open_tab_ex(app: &AppHandle, url: Url, background: bool, pin_owner: Option<St
             let candidates = {
                 let s = app.state::<Mutex<TabState>>();
                 let s = s.lock().unwrap();
-                s.order.iter().filter(|l| *l != PLATFORM_TAB).cloned().collect::<Vec<_>>()
+                s.order
+                    .iter()
+                    .filter(|l| *l != PLATFORM_TAB)
+                    .cloned()
+                    .collect::<Vec<_>>()
             };
             for l in candidates {
-                let Some(wv) = app.get_webview(&l) else { continue };
+                let Some(wv) = app.get_webview(&l) else {
+                    continue;
+                };
                 let same = wv
                     .url()
                     .ok()
@@ -2190,7 +2221,11 @@ fn open_tab_ex(app: &AppHandle, url: Url, background: bool, pin_owner: Option<St
         let state = app.state::<Mutex<TabState>>();
         let mut s = state.lock().unwrap();
         // Phone sits right after Platform (owner 2026-11-18); others append.
-        let index = if is_voice { 1.min(s.order.len()) } else { s.order.len() };
+        let index = if is_voice {
+            1.min(s.order.len())
+        } else {
+            s.order.len()
+        };
         s.order.insert(index, label.clone());
         if is_voice {
             s.voice.push(label.clone());
@@ -2359,7 +2394,12 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
     if let Some(next) = &reactivate {
         activate(app, next);
     }
-    let active_now = app.state::<Mutex<TabState>>().lock().unwrap().active.clone();
+    let active_now = app
+        .state::<Mutex<TabState>>()
+        .lock()
+        .unwrap()
+        .active
+        .clone();
     let _ = app.emit(
         "tab:closed",
         serde_json::json!({ "label": label, "active": active_now }),
@@ -2406,7 +2446,12 @@ fn relayout(app: &AppHandle) {
     if let Some(title_bar) = app.get_webview("title_bar") {
         let _ = title_bar.set_size(LogicalSize::new(lw, TITLE_BAR_HEIGHT));
     }
-    let active = app.state::<Mutex<TabState>>().lock().unwrap().active.clone();
+    let active = app
+        .state::<Mutex<TabState>>()
+        .lock()
+        .unwrap()
+        .active
+        .clone();
     if let Some(content) = app.get_webview(&active) {
         let _ = content.set_position(LogicalPosition::new(0.0, TITLE_BAR_HEIGHT));
         let _ = content.set_size(LogicalSize::new(lw, content_h));
@@ -2425,7 +2470,9 @@ fn logical_inner(window: &tauri::Window) -> Option<(f64, f64)> {
 
 #[tauri::command]
 fn switch_tab(app: AppHandle, label: String) {
-    let _ = app.clone().run_on_main_thread(move || activate(&app, &label));
+    let _ = app
+        .clone()
+        .run_on_main_thread(move || activate(&app, &label));
 }
 
 #[tauri::command]
@@ -2459,7 +2506,9 @@ fn popup_answer(app: AppHandle, contact_id: String) {
         if EXITING.load(Ordering::SeqCst) {
             return; // the softphone is already being ended
         }
-        let Some(label) = phone_tab_label(&app) else { return };
+        let Some(label) = phone_tab_label(&app) else {
+            return;
+        };
         if let Some(main) = app.get_window("main") {
             let _ = main.unminimize();
             let _ = main.show();
