@@ -5,10 +5,11 @@ name: Release
 # bundles the right CLI commands per platform.
 #
 # To cut a release:
-#   1. Bump the "version" field in ALL THREE of package.json,
-#      src-tauri/tauri.conf.json and src-tauri/Cargo.toml (keep them
+#   1. Bump the "version" field in ALL FOUR of package.json,
+#      src-tauri/tauri.conf.json, src-tauri/Cargo.toml and the
+#      vista-platform entry of src-tauri/Cargo.lock (keep them
 #      identical) — the "Verify tag matches versions" step below runs
-#      scripts/check-versions.mjs, which compares all three against the
+#      scripts/check-versions.mjs, which compares all four against the
 #      tag and fails the build if any disagree
 #   2. Commit + push
 #   3. Tag: `git tag v0.2.0 && git push origin v0.2.0`

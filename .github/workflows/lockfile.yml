@@ -38,11 +38,14 @@ jobs:
         working-directory: src-tauri
         shell: bash
         run: |
-          # Every Tauri-family crate v0.2.7 was built with. Each crate's newer
+          # Every Tauri-family crate v0.2.7 was built with, plus the
+          # single-instance plugin v0.3.1 added (2.4.5, the last release that
+          # still runs on tauri 2.11). Each crate's newer
           # release needs a newer version of another, so no single order works:
           # retry in rounds (a pin that can't land yet is skipped this round),
           # then require every one to be exact.
-          SPECS="tauri-plugin-dialog@2.7.2 tauri-plugin-updater@2.10.1 tauri-plugin-fs@2.5.1
+          SPECS="tauri-plugin-single-instance@2.4.5
+                 tauri-plugin-dialog@2.7.2 tauri-plugin-updater@2.10.1 tauri-plugin-fs@2.5.1
                  tauri-plugin@2.6.3 tauri@2.11.5 tauri-runtime-wry@2.11.4 tauri-runtime@2.11.3
                  tauri-build@2.6.3 tauri-codegen@2.6.3 tauri-macros@2.6.3 tauri-utils@2.9.3
                  tauri-winres@0.3.6 wry@0.55.1 tao@0.35.3 muda@0.19.3 tray-icon@0.24.2

@@ -121,11 +121,13 @@ Replace `REPLACE_WITH_PUBLIC_KEY_FROM_TAURI_SIGNER_GENERATE` in
 
 ## Cut a release
 
-Bump the version in **three** files, keeping them identical:
-`package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`.
-Miss `Cargo.toml` and the release fails — `scripts/check-versions.mjs`
-compares all three, and `release.yml` runs it before the slow Rust
-build. `Cargo.lock` is gitignored, so there's nothing to regenerate.
+Bump the version in **four** places, keeping them identical:
+`package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, and
+the `vista-platform` entry in `src-tauri/Cargo.lock` (committed since
+2026-09-28; the test build runs `--locked`, which fails on a stale one, and
+a `cargo check` in `src-tauri` updates that entry for you).
+`scripts/check-versions.mjs` compares all four, and `release.yml` runs it
+before the slow Rust build.
 
 ```bash
 node scripts/check-versions.mjs v0.2.0   # verify locally first
@@ -225,13 +227,14 @@ going through the Store.
 
 ## Versioning
 
-Three version strings need to stay in lockstep (same list as "Cut a
+Four version strings need to stay in lockstep (same list as "Cut a
 release" above):
 - `package.json` → `"version"`
 - `src-tauri/tauri.conf.json` → `"version"`
 - `src-tauri/Cargo.toml` → `version`
+- `src-tauri/Cargo.lock` → the `vista-platform` package's `version`
 
-`scripts/check-versions.mjs` compares all three against the tag, and
+`scripts/check-versions.mjs` compares all four against the tag, and
 `release.yml` runs it before the Rust build — a mismatch FAILS the
 release rather than producing confusingly-named artifacts. The bundle
 name and the GitHub Release tag come from `tauri.conf.json`.

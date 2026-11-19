@@ -28,15 +28,16 @@
 // cookie is shared across them (no re-login per tab).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::Duration;
 // `Manager` brings get_webview / get_window / state / manage into scope;
 // `Emitter` brings emit (title-bar notifications). Both, plus the
 // multi-webview API (WindowBuilder / WebviewBuilder / Window::add_child /
 // get_webview), are unstable-gated — keep `features=["unstable"]`.
-use tauri::webview::NewWindowResponse;
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalSize, Url, WebviewBuilder,
-    WebviewUrl, WindowBuilder, WindowEvent,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalSize, RunEvent, Url,
+    WebviewBuilder, WebviewUrl, WindowBuilder, WindowEvent,
 };
 
 // Production URL the first (Platform) tab loads. MUST be the Platform
@@ -741,6 +742,15 @@ const PHONE_STATE_SENTINEL: &str = "https://vista-desktop.invalid/__phone_state_
 // URL-encoded contact id): the incoming-call pop-up (owner 2026-11-18).
 const CALL_RINGING_SENTINEL: &str = "https://vista-desktop.invalid/__call_ringing__/";
 const CALL_RING_OVER_SENTINEL: &str = "https://vista-desktop.invalid/__call_ring_over__/";
+// The Phone or Platform page's LAST resort (v0.3.1): restart the whole app.
+// David's Phone tab (2026-11-19) stuck on "Initializing…" for hours because
+// the jam lived in this process's WebView2 engine, which rebuilding the tab
+// or the page never replaces; only a fresh process did. The shell ends the
+// softphone cleanly, waits for the engine to exit, and starts a new copy.
+// Refused during a live call. Followed by /<per-launch token>; see
+// restart_bridge_script() for why. No UI of its own: the web page decides
+// when to call window.__VISTA_RESTART_APP().
+const RESTART_APP_SENTINEL: &str = "https://vista-desktop.invalid/__restart_app__/";
 // Label of the incoming-call pop-up window (local popup.html).
 const CALL_POPUP: &str = "call-popup";
 // The pop-up's size in logical pixels, and its gap from the screen corner.
@@ -781,10 +791,87 @@ const VOICE_BRIDGE_SCRIPT: &str = r#"(function () {
   };
 })();"#;
 
-// Label of the managed Connect sign-in window (Tauri-owned so the shell can
-// close it deterministically — the engine-native popup WebView2 spawns for
-// window.open could linger as a fully-functional duplicate CCP).
+/// `window.__VISTA_RESTART_APP()`, defined ONLY in a top-level document on the
+/// Platform origin. Bridge scripts are injected into every frame (wry on
+/// Windows — see the DIALOG_CAPTURE_SCRIPT notes), so without this any
+/// embedded third-party frame could restart the app, and a restart throws
+/// away unsaved work in every tab. The sentinel therefore carries a token
+/// made fresh for each launch; a frame that isn't top-level Platform returns
+/// before it ever touches it, and injected script text is never readable by
+/// the page. The shell additionally accepts it only from the Platform tab or
+/// a Phone tab whose page is on the Platform origin (decide_new_window).
+fn restart_bridge_script() -> String {
+    format!(
+        "(function () {{\n  if (window.top !== window || location.origin !== 'https://{host}') return;\n  var token = '{token}';\n  window.__VISTA_RESTART_APP = function () {{\n    window.open('{sentinel}' + token);\n  }};\n}})();",
+        host = PLATFORM_HOST,
+        token = restart_token(),
+        sentinel = RESTART_APP_SENTINEL,
+    )
+}
+
+/// This launch's restart token: 128 bits from std's per-process random
+/// SipHash keys (no extra crate). Only the bridge script and the check in
+/// decide_new_window ever see it.
+fn restart_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut token = String::with_capacity(32);
+        for salt in [0x5649_5354_4131_u64, u64::from(std::process::id())] {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u64(salt);
+            token.push_str(&format!("{:016x}", h.finish()));
+        }
+        token
+    })
+}
+
+// Managed Connect sign-in windows (Tauri-owned so the shell can close them
+// deterministically — the engine-native popup WebView2 spawns for
+// window.open could linger as a fully-functional duplicate CCP). Each one
+// gets a fresh label, "connect-login-<n>" (v0.3.1): a new sign-in never has
+// to wait for, or re-point, a window that is already closing.
 const LOGIN_WINDOW: &str = "connect-login";
+static LOGIN_COUNTER: AtomicU32 = AtomicU32::new(0);
+// The sign-in window that is open, NOT closing and not yet finished, if any.
+// Only this one is ever re-pointed at a new sign-in URL: a navigation sent to
+// a closing window is lost, and with it the one-time sign-in URL.
+static LOGIN_LIVE: Mutex<Option<String>> = Mutex::new(None);
+// After the sign-in lands on /voice/signin-complete: a short grace for that
+// page's own script, then the shell closes the window itself (a page-level
+// window.close() only tears out wry's inner view and leaves an empty frame —
+// which also kept the app alive in v0.3.0). The backstop closes it however
+// the page ended.
+const LOGIN_DONE_GRACE_MS: u64 = 500;
+const LOGIN_BACKSTOP_MS: u64 = 5000;
+
+// The Phone page's softphone teardown, run in-page before its web view goes
+// away. The page wraps connect.core.terminate() so it also removes the CCP
+// frames (platform 9a027dd2); see close_tab_impl for why it must run while
+// the tab's own web view is still alive.
+const TERMINATE_PHONE_JS: &str = "try{window.connect&&window.connect.core&&window.connect.core.terminate&&window.connect.core.terminate()}catch(e){}";
+// How long the terminate gets to reach the CCP's shared worker before the
+// web view is destroyed (the same beat close_tab_impl has used since 0.2.x).
+const PHONE_TEARDOWN_MS: u64 = 700;
+
+// Quitting for real (v0.3.1). In v0.3.0, once a call had rung, closing the
+// main window left vista-platform.exe running invisibly (the hidden call
+// pop-up kept it alive, and so did an empty sign-in frame), with no tray icon
+// and no single-instance guard: every reopen attached to the same — possibly
+// jammed — WebView2 engine. Now closing really quits, and the process outlives
+// its engine only until the engine has exited.
+static EXITING: AtomicBool = AtomicBool::new(false);
+// Start a fresh copy once this one is gone: the restart sentinel, or someone
+// opening Vista Platform again while it was still shutting down.
+static RELAUNCH: AtomicBool = AtomicBool::new(false);
+// finish_exit() has run (it may be reached from the engine-exit event and
+// from its fallback timer — only the first counts).
+static EXIT_SENT: AtomicBool = AtomicBool::new(false);
+// finish_exit() chose request_restart(), so Tauri itself starts the new copy.
+static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+// Longest wait for the WebView2 engine to exit once every web view is closed
+// (normally well under a second or two). Then the app leaves anyway.
+const ENGINE_EXIT_TIMEOUT_MS: u64 = 4000;
 
 // Whether a call is live right now (armed by the voice page via the call
 // sentinel; cleared on end/destroy or when the voice tab is force-closed).
@@ -793,6 +880,49 @@ static CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
 // The call ringing on this computer right now, as the Phone tab described it
 // ({contactId, name, tag, number, startedAt}) — what the pop-up shows.
 static RINGING: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+
+type MainJob = Box<dyn FnOnce(&AppHandle) + Send>;
+
+/// Run `job` on the main thread on a LATER turn of the event loop — never
+/// inline (v0.3.1 hardening). AppHandle::run_on_main_thread runs the closure
+/// immediately when it is called ON the main thread, i.e. from inside
+/// whatever WebView2 callback we are in (new-window, navigation, page load,
+/// window.close). Creating or destroying windows and web views from inside a
+/// WebView2 callback is the documented reentrancy deadlock. One forwarding
+/// thread posts the jobs through the event-loop proxy, which is FIFO, so
+/// they still run in the order they were queued.
+fn later(app: &AppHandle, job: impl FnOnce(&AppHandle) + Send + 'static) {
+    static QUEUE: OnceLock<mpsc::Sender<MainJob>> = OnceLock::new();
+    let tx = QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<MainJob>();
+        let app = app.clone();
+        std::thread::spawn(move || {
+            for job in rx {
+                let a = app.clone();
+                let _ = app.run_on_main_thread(move || job(&a));
+            }
+        });
+        tx
+    });
+    if let Err(mpsc::SendError(job)) = tx.send(Box::new(job)) {
+        // The forwarding thread is gone: a one-off thread still posts the job
+        // (rather than running it inline).
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let a = app.clone();
+            let _ = app.run_on_main_thread(move || job(&a));
+        });
+    }
+}
+
+/// `later`, after `ms` milliseconds.
+fn later_after(app: &AppHandle, ms: u64, job: impl FnOnce(&AppHandle) + Send + 'static) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(ms));
+        later(&app, job);
+    });
+}
 
 /// Set the call-active flag AND (Windows) hold/release a system-sleep block so
 /// a live call can't be dropped by the machine sleeping. The power request is
@@ -919,12 +1049,20 @@ pub fn run() {
         "--autoplay-policy=no-user-gesture-required",
     );
     tauri::Builder::default()
-        // ⚠️ ORDER IS LOAD-BEARING. This must stay the FIRST .plugin() call:
-        // plugin init scripts run in registration order, and the capture only
-        // works while window.confirm/alert/prompt are still the pristine
-        // natives — i.e. strictly before tauri_plugin_dialog::init() below
-        // injects its init-iife.js. Moving it down re-breaks every
-        // confirm-gated destructive action in the shell.
+        // Single instance (v0.3.1) — FIRST, as the plugin requires: a second
+        // launch must hand over and exit while plugins initialize, before any
+        // other plugin or window starts. It injects no init script, so the
+        // dialog capture below is still the first SCRIPT to run.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            on_second_launch(app)
+        }))
+        // ⚠️ ORDER IS LOAD-BEARING. This must stay the first plugin WITH AN
+        // INIT SCRIPT, and before tauri_plugin_dialog::init(): plugin init
+        // scripts run in registration order, and the capture only works while
+        // window.confirm/alert/prompt are still the pristine natives — i.e.
+        // strictly before the dialog plugin injects its init-iife.js. Moving
+        // it below the dialog plugin re-breaks every confirm-gated destructive
+        // action in the shell.
         .plugin(dialog_capture_plugin())
         // Updater plugin: endpoint + pubkey configured in tauri.conf.json.
         // Registration alone does NOTHING in Tauri 2 — the launch check
@@ -970,21 +1108,22 @@ pub fn run() {
                 // every webview automatically, ahead of the dialog plugin's.
                 // desktop_marker_script() must stay FIRST: the dialog
                 // diagnostic reads window.__VISTA_DESKTOP__ for the version.
-                // 3 placeholders, 3 args.
+                // 4 placeholders, 4 args.
                 .initialization_script(format!(
-                    "{}{}{}",
+                    "{}{}{}{}",
                     desktop_marker_script(),
                     DIALOG_GLOBALS_SCRIPT,
-                    VOICE_BRIDGE_SCRIPT
+                    VOICE_BRIDGE_SCRIPT,
+                    restart_bridge_script()
                 ))
-                .on_new_window(move |url, _features| decide_new_window(&nw_app, url))
+                .on_new_window(move |url, _features| decide_new_window(&nw_app, PLATFORM_TAB, url))
                 .on_navigation(move |nav_url| {
                     if let Some(flag) = nav_url.as_str().strip_prefix(CALL_SENTINEL) {
                         set_call_active(&nav_plat_app, flag.starts_with('1'));
                         return false; // cancel the sentinel nav; page stays put
                     }
                     if nav_url.as_str().starts_with(AGENT_READY_SENTINEL) {
-                        close_login_window(&nav_plat_app);
+                        later(&nav_plat_app, close_login_window);
                         return false;
                     }
                     true
@@ -1012,7 +1151,9 @@ pub fn run() {
 
             // Keep the title bar + the active tab sized to the window; block
             // a window close while a call is live (closing hangs up with no
-            // rejoin — the title bar shows Keep call / Close anyway instead).
+            // rejoin — the title bar shows Keep call / Close anyway instead);
+            // otherwise closing the window QUITS the app (v0.3.1, owner:
+            // "closing the app should really close it").
             let resize_app = app.handle().clone();
             window.on_window_event(move |event| {
                 match event {
@@ -1021,14 +1162,23 @@ pub fn run() {
                     // the incoming-call pop-up follows (owner 2026-11-18).
                     WindowEvent::Focused(_) => refresh_popup(&resize_app),
                     WindowEvent::CloseRequested { api, .. } => {
-                        if CALL_ACTIVE.load(Ordering::SeqCst) {
-                            api.prevent_close();
+                        // The window never closes on its own: the Phone tab's
+                        // softphone must be ended while its web view is still
+                        // alive, so begin_exit tears down first and then
+                        // exits the whole app (taking this window with it).
+                        api.prevent_close();
+                        if EXITING.load(Ordering::SeqCst) {
+                            // Already on the way out.
+                        } else if CALL_ACTIVE.load(Ordering::SeqCst) {
                             let _ = resize_app.emit(
                                 "call:close-blocked",
                                 serde_json::json!({ "kind": "window" }),
                             );
+                        } else {
+                            later(&resize_app, |app| begin_exit(app, false));
                         }
                     }
+                    WindowEvent::Destroyed => main_window_gone(&resize_app),
                     _ => {}
                 }
             });
@@ -1056,8 +1206,214 @@ pub fn run() {
             popup_answer,
             popup_ignore,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Someone opened Vista Platform again while this copy was already
+            // shutting down, after it had chosen a plain exit: start the new
+            // copy now. The single-instance plugin has just released its lock
+            // (plugins see Exit before this callback), so the new copy becomes
+            // the running one instead of handing over to this dying one.
+            if let RunEvent::Exit = event {
+                if RELAUNCH.load(Ordering::SeqCst) && !RESTART_REQUESTED.load(Ordering::SeqCst) {
+                    app.cleanup_before_exit();
+                    tauri::process::restart(&app.env());
+                }
+            }
+        });
+}
+
+// ─── Quitting and restarting (v0.3.1) ───────────────────────────────
+
+/// A second launch of Vista Platform (single-instance plugin; runs on the main
+/// thread). Normally: bring the running window to the front. While this copy
+/// is shutting down: remember to start a fresh copy once it is gone, so the
+/// launch isn't lost.
+fn on_second_launch(app: &AppHandle) {
+    if EXITING.load(Ordering::SeqCst) {
+        RELAUNCH.store(true, Ordering::SeqCst);
+        return;
+    }
+    if let Some(main) = app.get_window("main") {
+        let _ = main.unminimize();
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+}
+
+/// Safety net: nothing may outlive the main window. (Only the exit itself
+/// destroys it today; anything else that ever does takes the app with it.)
+fn main_window_gone(app: &AppHandle) {
+    if !EXITING.swap(true, Ordering::SeqCst) {
+        app.exit(0);
+    }
+}
+
+/// Leave the app for real — `relaunch` starts a fresh copy afterwards. In
+/// order: every Phone tab ends its softphone in-page (the same wrapped
+/// connect.core.terminate() close_tab_impl runs) while its web view is still
+/// alive; nothing stays on screen (main window hidden, call pop-up and sign-in
+/// windows closed); after the teardown beat every web view is closed, the
+/// WebView2 engine is given time to exit, and only then does the process exit
+/// (finish_exit). A relaunch therefore always gets a fresh engine. Callers
+/// check the live-call guard first ("Close anyway" deliberately skips it).
+/// Runs on the main thread.
+fn begin_exit(app: &AppHandle, relaunch: bool) {
+    if relaunch {
+        RELAUNCH.store(true, Ordering::SeqCst);
+    }
+    if EXITING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    set_call_active(app, false);
+    *RINGING.lock().unwrap() = None;
+    let phones = app.state::<Mutex<TabState>>().lock().unwrap().voice.clone();
+    let mut any_phone = false;
+    for label in &phones {
+        if let Some(wv) = app.get_webview(label) {
+            let _ = wv.eval(TERMINATE_PHONE_JS);
+            any_phone = true;
+        }
+    }
+    if let Some(main) = app.get_window("main") {
+        let _ = main.hide();
+    }
+    if let Some(popup) = app.get_webview_window(CALL_POPUP) {
+        let _ = popup.close();
+    }
+    close_login_window(app);
+    let beat = if any_phone { PHONE_TEARDOWN_MS } else { 0 };
+    later_after(app, beat, close_all_then_exit);
+}
+
+/// Close every web view so the WebView2 engine shuts down, then exit once it
+/// has (or after ENGINE_EXIT_TIMEOUT_MS). The main window stays, hidden, until
+/// the process exits, so Tauri doesn't quit early on "last window closed".
+/// Runs on the main thread.
+fn close_all_then_exit(app: &AppHandle) {
+    #[cfg(windows)]
+    let watching = watch_engine_exit(app);
+    #[cfg(not(windows))]
+    let watching = false;
+    // Windows first: webview_windows() only lists windows whose web view is
+    // still open.
+    for (label, window) in app.webview_windows() {
+        if label != "main" {
+            let _ = window.close();
+        }
+    }
+    for webview in app.webviews().into_values() {
+        let _ = webview.close();
+    }
+    let wait = if watching {
+        ENGINE_EXIT_TIMEOUT_MS
+    } else {
+        300
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(wait));
+        finish_exit(&app);
+    });
+}
+
+/// The last step of begin_exit (once; any thread). Both paths fire
+/// RunEvent::Exit, where the single-instance plugin releases its lock BEFORE
+/// any new copy starts. (AppHandle::restart() called on the main thread skips
+/// that event, so the new copy would find the lock still held, hand over to
+/// this dying copy and exit — leaving nothing running.)
+fn finish_exit(app: &AppHandle) {
+    if EXIT_SENT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if RELAUNCH.load(Ordering::SeqCst) {
+        RESTART_REQUESTED.store(true, Ordering::SeqCst);
+        app.request_restart();
+    } else {
+        app.exit(0);
+    }
+}
+
+/// Have finish_exit run the moment this app's WebView2 browser process exits
+/// (after every web view is closed). Returns false when the engine can't be
+/// watched; the caller then just waits a moment. The engine is shared by
+/// every web view here (same profile, same options), and with the
+/// single-instance plugin no other copy of the app can be using it. Runs on
+/// the main thread, BEFORE the web views are closed.
+#[cfg(windows)]
+fn watch_engine_exit(app: &AppHandle) -> bool {
+    let Some(webview) = app
+        .get_webview(PLATFORM_TAB)
+        .or_else(|| app.webviews().into_values().next())
+    else {
+        return false;
+    };
+    let (tx, rx) = mpsc::channel::<bool>();
+    let done_app = app.clone();
+    let result = webview.with_webview(move |platform_webview| {
+        let watched = on_engine_exit(&platform_webview.controller(), done_app);
+        if let Err(e) = &watched {
+            eprintln!("[vista-desktop] can't watch the engine exit: {e}");
+        }
+        let _ = tx.send(watched.is_ok());
+    });
+    // with_webview runs inline on the main thread, so the answer is already
+    // there. Never block waiting for it: if it were queued instead, waiting
+    // here would hold up the very loop that has to run it.
+    result.is_ok() && rx.try_recv().unwrap_or(false)
+}
+
+/// Register finish_exit on the BrowserProcessExited event of `controller`'s
+/// WebView2 environment. Call on the UI thread that owns the controller.
+#[cfg(windows)]
+fn on_engine_exit(
+    controller: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller,
+    done_app: AppHandle,
+) -> windows::core::Result<()> {
+    use webview2_com::BrowserProcessExitedEventHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Environment5, ICoreWebView2_2,
+    };
+    use windows::core::Interface;
+
+    // SAFETY: WebView2 COM calls on the UI thread that owns the controller
+    // (with_webview runs us there); the event handler fires on it too.
+    unsafe {
+        let env = controller
+            .CoreWebView2()?
+            .cast::<ICoreWebView2_2>()?
+            .Environment()?
+            .cast::<ICoreWebView2Environment5>()?;
+        let handler = BrowserProcessExitedEventHandler::create(Box::new(move |_, _| {
+            finish_exit(&done_app);
+            Ok(())
+        }));
+        let mut token: i64 = 0;
+        env.add_BrowserProcessExited(&handler, &mut token)?;
+        // Keep the environment (and so the registration) alive until the
+        // event fires; the process is about to exit anyway.
+        std::mem::forget(env);
+    }
+    Ok(())
+}
+
+/// The restart sentinel: accepted only from the Platform tab or a Phone tab
+/// whose page is on the Platform origin, carrying this launch's token, and
+/// never during a live call.
+fn restart_allowed(app: &AppHandle, from: &str, token: &str) -> bool {
+    if token != restart_token() || CALL_ACTIVE.load(Ordering::SeqCst) {
+        return false;
+    }
+    let phone_or_platform = from == PLATFORM_TAB || {
+        let s = app.state::<Mutex<TabState>>();
+        let s = s.lock().unwrap();
+        s.voice.iter().any(|v| v == from)
+    };
+    phone_or_platform
+        && app
+            .get_webview(from)
+            .and_then(|wv| wv.url().ok())
+            .is_some_and(|url| url.scheme() == "https" && url.host_str() == Some(PLATFORM_HOST))
 }
 
 // ─── Auto-update ────────────────────────────────────────────────────────
@@ -1092,8 +1448,14 @@ fn spawn_update_check(app: &tauri::AppHandle) {
                     return;
                 }
                 tauri::async_runtime::spawn(async move {
+                    // On Windows the installer takes over: download_and_install
+                    // launches it and ends this process itself (so the
+                    // single-instance lock goes with it) and the installer
+                    // reopens the new version. Elsewhere it returns, and
+                    // request_restart goes through RunEvent::Exit, where the
+                    // single-instance plugin lets go before the new copy starts.
                     if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
-                        restart_handle.restart();
+                        restart_handle.request_restart();
                     }
                 });
             });
@@ -1108,8 +1470,17 @@ fn spawn_update_check(app: &tauri::AppHandle) {
 /// the shell can deterministically close — the engine-native popup could
 /// linger after login as a fully-functional duplicate CCP); an internal
 /// /manage/* page on the Platform host opens as a new tab; everything
-/// else opens in the system browser.
-fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry> {
+/// else opens in the system browser. `from` is the label of the tab whose
+/// page asked.
+///
+/// Window and web view work is queued with `later` (v0.3.1): wry already runs
+/// this after the WebView2 callback returns, but the request's deferral is
+/// still open until we return; nothing is created or destroyed under it.
+fn decide_new_window(app: &AppHandle, from: &str, url: Url) -> NewWindowResponse<tauri::Wry> {
+    // The app is quitting: open nothing, start nothing.
+    if EXITING.load(Ordering::SeqCst) {
+        return NewWindowResponse::Deny;
+    }
     // Voice-bridge sentinels arrive as window.open() (see VOICE_BRIDGE_SCRIPT
     // beforeunload note) — consume them here, open nothing.
     if let Some(flag) = url.as_str().strip_prefix(CALL_SENTINEL) {
@@ -1117,33 +1488,32 @@ fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry>
         return NewWindowResponse::Deny;
     }
     if url.as_str().starts_with(AGENT_READY_SENTINEL) {
-        let app = app.clone();
-        let _ = app
-            .clone()
-            .run_on_main_thread(move || close_login_window(&app));
+        later(app, close_login_window);
         return NewWindowResponse::Deny;
     }
     if url.as_str().starts_with(RECONNECT_SENTINEL) {
-        let app = app.clone();
-        let _ = app
-            .clone()
-            .run_on_main_thread(move || reconnect_voice(&app));
+        later(app, reconnect_voice);
+        return NewWindowResponse::Deny;
+    }
+    if let Some(token) = url.as_str().strip_prefix(RESTART_APP_SENTINEL) {
+        if restart_allowed(app, from, token) {
+            later(app, |app| {
+                // Re-checked here: a call may have started in between.
+                if !CALL_ACTIVE.load(Ordering::SeqCst) {
+                    begin_exit(app, true);
+                }
+            });
+        }
         return NewWindowResponse::Deny;
     }
     if let Some(rest) = url.as_str().strip_prefix(PHONE_ALWAYS_ON_SENTINEL) {
         if let Some((company, user)) = parse_phone_owner(rest) {
-            let app = app.clone();
-            let _ = app
-                .clone()
-                .run_on_main_thread(move || ensure_phone_tab(&app, company, user));
+            later(app, move |app| ensure_phone_tab(app, company, user));
         }
         return NewWindowResponse::Deny;
     }
     if url.as_str().starts_with(PHONE_SIGNED_OUT_SENTINEL) {
-        let app = app.clone();
-        let _ = app
-            .clone()
-            .run_on_main_thread(move || close_phone_tabs(&app));
+        later(app, close_phone_tabs);
         return NewWindowResponse::Deny;
     }
     if let Some(state) = url.as_str().strip_prefix(PHONE_STATE_SENTINEL) {
@@ -1156,8 +1526,7 @@ fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry>
     if let Some(payload) = url.as_str().strip_prefix(CALL_RINGING_SENTINEL) {
         if let Some(info) = parse_ringing(&percent_decode(payload)) {
             *RINGING.lock().unwrap() = Some(info);
-            let app = app.clone();
-            let _ = app.clone().run_on_main_thread(move || refresh_popup(&app));
+            later(app, refresh_popup);
         }
         return NewWindowResponse::Deny;
     }
@@ -1176,16 +1545,12 @@ fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry>
             same
         };
         if cleared {
-            let app = app.clone();
-            let _ = app.clone().run_on_main_thread(move || refresh_popup(&app));
+            later(app, refresh_popup);
         }
         return NewWindowResponse::Deny;
     }
     if is_auth_popup_host(url.host_str().unwrap_or("")) {
-        let app = app.clone();
-        let _ = app
-            .clone()
-            .run_on_main_thread(move || open_login_window(&app, url));
+        later(app, move |app| open_login_window(app, url));
         return NewWindowResponse::Deny;
     }
     route_new_window(app, url);
@@ -1208,29 +1573,164 @@ fn decide_new_window(app: &AppHandle, url: Url) -> NewWindowResponse<tauri::Wry>
 /// An EXISTING window is re-pointed at the new URL (2026-10-28): the sign-in
 /// URL is one-time, and the old "just focus it" left a stalled, blank window
 /// swallowing every later sign-in until the app was restarted — a page
-/// refresh or "Reconnect now" could never get past "Initializing…".
+/// refresh or "Reconnect now" could never get past "Initializing…". Only the
+/// LIVE window is re-pointed, never one that is closing (v0.3.1): that one is
+/// left to close and the sign-in gets a fresh window.
+///
+/// Once the sign-in lands on /voice/signin-complete the shell closes the
+/// window itself (v0.3.1): after that page has loaded (plus a short grace for
+/// its script), at once if the page calls window.close() itself — which
+/// otherwise destroys only wry's inner view and leaves an empty frame on
+/// screen — and, failing both, a few seconds after it landed. Runs on the
+/// main thread.
 fn open_login_window(app: &AppHandle, url: Url) {
-    if let Some(existing) = app.get_webview_window(LOGIN_WINDOW) {
-        if let Err(e) = existing.navigate(url) {
-            eprintln!("[vista-desktop] login window navigate failed: {e}");
-        }
-        let _ = existing.set_focus();
+    if EXITING.load(Ordering::SeqCst) {
         return;
     }
-    let result = tauri::WebviewWindowBuilder::new(app, LOGIN_WINDOW, WebviewUrl::External(url))
+    let live = LOGIN_LIVE.lock().unwrap().clone();
+    if let Some(label) = live {
+        if let Some(existing) = app.get_webview_window(&label) {
+            match existing.navigate(url.clone()) {
+                Ok(()) => {
+                    let _ = existing.set_focus();
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("[vista-desktop] login window navigate failed: {e}");
+                    close_login_label(app, &label);
+                }
+            }
+        }
+    }
+    let label = format!(
+        "{LOGIN_WINDOW}-{}",
+        LOGIN_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let nav_app = app.clone();
+    let nav_label = label.clone();
+    let load_app = app.clone();
+    let result = tauri::WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
         .title("Sign in — Vista Phone")
         .inner_size(480.0, 700.0)
         .center()
+        .on_navigation(move |nav_url| {
+            if is_signin_complete(nav_url) {
+                // This window's sign-in is done: a later sign-in gets a fresh
+                // window rather than this one, so the closes queued for it
+                // can never cut a new sign-in short.
+                retire_login_label(&nav_label);
+                // Backstop: gone a few seconds after the sign-in landed,
+                // however the page ends.
+                let label = nav_label.clone();
+                later_after(&nav_app, LOGIN_BACKSTOP_MS, move |app| {
+                    close_login_label(app, &label)
+                });
+            }
+            true
+        })
+        .on_page_load(move |window, payload| {
+            if payload.event() == PageLoadEvent::Finished && is_signin_complete(payload.url()) {
+                let label = window.label().to_string();
+                later_after(&load_app, LOGIN_DONE_GRACE_MS, move |app| {
+                    close_login_label(app, &label)
+                });
+            }
+        })
         .build();
-    if let Err(e) = result {
-        eprintln!("[vista-desktop] failed to open login window: {e}");
+    let window = match result {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[vista-desktop] failed to open login window: {e}");
+            return;
+        }
+    };
+    *LOGIN_LIVE.lock().unwrap() = Some(label.clone());
+    // Closed from its own title bar, or by the shell: no longer the live one.
+    let event_label = label.clone();
+    window.on_window_event(move |event| {
+        if matches!(
+            event,
+            WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+        ) {
+            retire_login_label(&event_label);
+        }
+    });
+    #[cfg(windows)]
+    close_login_on_page_close(app, &label);
+}
+
+/// The page the federation sign-in lands on once AWS has set the Connect
+/// session cookies (platform app/voice/signin-complete).
+fn is_signin_complete(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some(PLATFORM_HOST)
+        && url.path().trim_end_matches('/') == "/voice/signin-complete"
+}
+
+/// Close every managed sign-in window (agent session is live → login done;
+/// a hard reconnect; quitting).
+fn close_login_window(app: &AppHandle) {
+    *LOGIN_LIVE.lock().unwrap() = None;
+    for (label, window) in app.webview_windows() {
+        if label.starts_with(LOGIN_WINDOW) {
+            let _ = window.close();
+        }
     }
 }
 
-/// Close the managed sign-in window (agent session is live → login done).
-fn close_login_window(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window(LOGIN_WINDOW) {
-        let _ = w.close();
+/// Close one sign-in window (the one that just finished, or failed).
+fn close_login_label(app: &AppHandle, label: &str) {
+    retire_login_label(label);
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.close();
+    }
+}
+
+/// `label` is no longer the sign-in window a new sign-in may re-point.
+fn retire_login_label(label: &str) {
+    let mut live = LOGIN_LIVE.lock().unwrap();
+    if live.as_deref() == Some(label) {
+        *live = None;
+    }
+}
+
+/// When a page in the sign-in window calls window.close(), close the whole
+/// window. wry's own handler for that event destroys only its inner view and
+/// leaves the empty frame on screen (and, in v0.3.0, the app alive). Both
+/// handlers run; ours just queues the real close.
+#[cfg(windows)]
+fn close_login_on_page_close(app: &AppHandle, label: &str) {
+    use webview2_com::WindowCloseRequestedEventHandler;
+
+    let Some(window) = app.get_webview_window(label) else {
+        return;
+    };
+    let close_app = app.clone();
+    let close_label = label.to_string();
+    let result = window.with_webview(move |platform_webview| {
+        // SAFETY: WebView2 COM calls on the UI thread that with_webview runs
+        // on; the handler fires on that thread too and only queues work.
+        unsafe {
+            let core = match platform_webview.controller().CoreWebView2() {
+                Ok(core) => core,
+                Err(e) => {
+                    eprintln!("[vista-desktop] login window CoreWebView2() failed: {e}");
+                    return;
+                }
+            };
+            let handler = WindowCloseRequestedEventHandler::create(Box::new(move |_, _| {
+                let label = close_label.clone();
+                later(&close_app, move |app| close_login_label(app, &label));
+                Ok(())
+            }));
+            let mut token: i64 = 0;
+            if let Err(e) = core.add_WindowCloseRequested(&handler, &mut token) {
+                eprintln!("[vista-desktop] login window close hook failed: {e}");
+            }
+        }
+    });
+    if let Err(e) = result {
+        eprintln!("[vista-desktop] login window with_webview failed: {e}");
     }
 }
 
@@ -1394,7 +1894,7 @@ fn close_phone_tabs(app: &AppHandle) {
 /// showing (its own caller card is enough then). Runs on the main thread.
 fn refresh_popup(app: &AppHandle) {
     let ringing = RINGING.lock().unwrap().clone();
-    let Some(info) = ringing else {
+    let Some(info) = ringing.filter(|_| !EXITING.load(Ordering::SeqCst)) else {
         hide_popup(app);
         return;
     };
@@ -1421,6 +1921,22 @@ fn show_popup(app: &AppHandle, info: serde_json::Value) {
         let _ = app.emit_to(CALL_POPUP, "popup:show", info);
         place_popup(app, &w);
         let _ = w.show();
+        return;
+    }
+    // Created on a later turn (refresh_popup is also reached from window
+    // events, e.g. Focused), never in the middle of another callback.
+    later(app, create_popup);
+}
+
+/// Create the (hidden) pop-up window if a call still rings and it doesn't
+/// exist yet; popup.html then asks for the call and popup_ready shows it.
+/// Runs on the main thread.
+fn create_popup(app: &AppHandle) {
+    let still_ringing = RINGING.lock().unwrap().is_some();
+    if !still_ringing
+        || EXITING.load(Ordering::SeqCst)
+        || app.get_webview_window(CALL_POPUP).is_some()
+    {
         return;
     }
     let built = tauri::WebviewWindowBuilder::new(app, CALL_POPUP, WebviewUrl::App("popup.html".into()))
@@ -1481,14 +1997,13 @@ fn phone_tab_label(app: &AppHandle) -> Option<String> {
 }
 
 /// Open an internal /manage/* page as a tab, anything else in the system
-/// browser. Window/webview mutations are deferred to the main thread to
-/// avoid reentrancy while the webview engine is mid new-window-request.
+/// browser. Window/webview mutations are deferred to a later main-thread turn
+/// to avoid reentrancy while the webview engine is mid new-window-request.
 fn route_new_window(app: &AppHandle, url: Url) {
     let is_internal_page =
         url.host_str() == Some(PLATFORM_HOST) && url.path().starts_with("/manage/");
     if is_internal_page {
-        let app = app.clone();
-        let _ = app.clone().run_on_main_thread(move || open_tab(&app, url));
+        later(app, move |app| open_tab(app, url));
     } else if let Err(e) = open::that_detached(url.as_str()) {
         eprintln!("[vista-desktop] failed to open {url} in browser: {e}");
     }
@@ -1543,6 +2058,11 @@ fn open_tab(app: &AppHandle, url: Url) {
 /// always-on Phone tab owned by "<companyId>/<userId>". Phone tabs always sit
 /// right after Platform. Runs on the main thread.
 fn open_tab_ex(app: &AppHandle, url: Url, background: bool, pin_owner: Option<String>) {
+    // Quitting: no new tabs (a delayed reopen from reconnect_voice or
+    // ensure_phone_tab can land here mid-exit).
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
     let window = match app.get_window("main") {
         Some(w) => w,
         None => return,
@@ -1611,29 +2131,33 @@ fn open_tab_ex(app: &AppHandle, url: Url, background: bool, pin_owner: Option<St
     let content_h = (lh - TITLE_BAR_HEIGHT).max(0.0);
 
     let nw_app = app.clone();
+    let nw_label = label.clone();
     let nav_app = app.clone();
     let nav_label = label.clone();
     let builder = WebviewBuilder::new(label.as_str(), WebviewUrl::External(url.clone()))
         // Tabs can themselves open further tabs / auth popups / external links.
-        .on_new_window(move |u, _features| decide_new_window(&nw_app, u))
+        .on_new_window(move |u, _features| decide_new_window(&nw_app, &nw_label, u))
         // Mark the desktop app, resolve the native dialog globals the dialog
         // plugin clobbers (from the capture plugin's stash — see
         // DIALOG_CAPTURE_SCRIPT), bridge window.close() → sentinel nav, and
-        // give the softphone page its call-active hook. desktop_marker_script()
-        // stays FIRST so the dialog diagnostic can read the app version off
-        // window.__VISTA_DESKTOP__. 4 placeholders, 4 args.
+        // give the softphone page its call-active hook (and the Platform-only
+        // restart hook). desktop_marker_script() stays FIRST so the dialog
+        // diagnostic can read the app version off window.__VISTA_DESKTOP__.
+        // 5 placeholders, 5 args.
         .initialization_script(format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             desktop_marker_script(),
             DIALOG_GLOBALS_SCRIPT,
             CLOSE_BRIDGE_SCRIPT,
-            VOICE_BRIDGE_SCRIPT
+            VOICE_BRIDGE_SCRIPT,
+            restart_bridge_script()
         ))
         .on_navigation(move |nav_url| {
             if nav_url.as_str().starts_with(CLOSE_SENTINEL) {
-                let a = nav_app.clone();
+                // Destroying this web view from inside its own navigation
+                // callback is exactly the reentrancy `later` avoids.
                 let l = nav_label.clone();
-                let _ = nav_app.run_on_main_thread(move || close_tab_impl(&a, &l, false));
+                later(&nav_app, move |app| close_tab_impl(app, &l, false));
                 return false; // cancel the sentinel nav; the tab is closing
             }
             if let Some(flag) = nav_url.as_str().strip_prefix(CALL_SENTINEL) {
@@ -1641,7 +2165,7 @@ fn open_tab_ex(app: &AppHandle, url: Url, background: bool, pin_owner: Option<St
                 return false; // cancel the sentinel nav; the page stays put
             }
             if nav_url.as_str().starts_with(AGENT_READY_SENTINEL) {
-                close_login_window(&nav_app);
+                later(&nav_app, close_login_window);
                 return false;
             }
             true
@@ -1811,13 +2335,11 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
             // terminate doesn't reach the orphan) — it must be torn down while
             // its OWN webview is still alive. So: terminate CCP in-page, give it
             // a beat to reach the shared worker, THEN destroy the webview.
-            let _ = wv.eval(
-                "try{window.connect&&window.connect.core&&window.connect.core.terminate&&window.connect.core.terminate()}catch(e){}",
-            );
+            let _ = wv.eval(TERMINATE_PHONE_JS);
             let app_close = app.clone();
             let label_close = label.to_string();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(700));
+                std::thread::sleep(Duration::from_millis(PHONE_TEARDOWN_MS));
                 let app_inner = app_close.clone();
                 let _ = app_close.run_on_main_thread(move || {
                     if let Some(wv) = app_inner.get_webview(&label_close) {
@@ -1934,6 +2456,9 @@ fn popup_ready(app: AppHandle) {
 fn popup_answer(app: AppHandle, contact_id: String) {
     let _ = app.clone().run_on_main_thread(move || {
         hide_popup(&app);
+        if EXITING.load(Ordering::SeqCst) {
+            return; // the softphone is already being ended
+        }
         let Some(label) = phone_tab_label(&app) else { return };
         if let Some(main) = app.get_window("main") {
             let _ = main.unminimize();
@@ -1983,17 +2508,20 @@ fn window_toggle_maximize(window: tauri::Window) -> tauri::Result<()> {
     }
 }
 
+/// The title bar's ✕: a normal close request, so the main window's
+/// CloseRequested handler decides (live-call guard, otherwise quit).
 #[tauri::command]
 fn window_close(window: tauri::Window) -> tauri::Result<()> {
     window.close()
 }
 
-/// Bypass the call-active close guard once the user has confirmed
-/// "Close anyway" in the title bar's confirm strip. destroy() skips
-/// CloseRequested entirely, so the guard can't re-block it.
+/// "Close anyway" in the title bar's confirm strip: the person chose to hang
+/// up, so skip the live-call guard — but still end the Phone tab's softphone
+/// first and then really quit (v0.3.1; it used to destroy() the window, which
+/// dropped the Phone tab without terminate and left the process running).
 #[tauri::command]
-fn window_force_close(window: tauri::Window) -> tauri::Result<()> {
-    window.destroy()
+fn window_force_close(app: AppHandle) {
+    later(&app, |app| begin_exit(app, false));
 }
 
 #[tauri::command]

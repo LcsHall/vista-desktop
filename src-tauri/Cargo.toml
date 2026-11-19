@@ -1,6 +1,6 @@
 [package]
 name = "vista-platform"
-version = "0.3.0"
+version = "0.3.1"
 description = "Vista Platform desktop app"
 authors = ["Vista Interface"]
 edition = "2021"
@@ -31,6 +31,13 @@ tauri = { version = "2", features = ["tray-icon", "unstable"] }
 tauri-plugin-updater = "2"
 # Native message dialog for the update prompt.
 tauri-plugin-dialog = "2"
+# One copy of the app at a time (v0.3.1). Opening Vista Platform while it is
+# already running brings the running window to the front instead of starting
+# a second copy attached to the same WebView2 engine (a stuck Phone tab
+# survived every reopen that way, 2026-11-19). `~2.4` ON PURPOSE: 2.5 and up
+# need tauri 2.12, and Cargo.lock pins the Tauri stack at 2.11.5 (see
+# .github/workflows/lockfile.yml). Move it only together with that stack.
+tauri-plugin-single-instance = "~2.4"
 # Serde for any IPC payloads (window state, etc).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
