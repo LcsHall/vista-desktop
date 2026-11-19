@@ -837,13 +837,20 @@ static LOGIN_COUNTER: AtomicU32 = AtomicU32::new(0);
 // Only this one is ever re-pointed at a new sign-in URL: a navigation sent to
 // a closing window is lost, and with it the one-time sign-in URL.
 static LOGIN_LIVE: Mutex<Option<String>> = Mutex::new(None);
-// After the sign-in lands on /voice/signin-complete: a short grace for that
-// page's own script, then the shell closes the window itself (a page-level
-// window.close() only tears out wry's inner view and leaves an empty frame —
-// which also kept the app alive in v0.3.0). The backstop closes it however
-// the page ended.
-const LOGIN_DONE_GRACE_MS: u64 = 500;
-const LOGIN_BACKSTOP_MS: u64 = 5000;
+// After the sign-in lands on /voice/signin-complete the shell closes the
+// window itself (a page-level window.close() only tears out wry's inner view
+// and leaves an empty frame — which also kept the app alive in v0.3.0).
+// Normally the page's own window.close() comes first and the shell closes the
+// window at once (close_login_on_page_close). These two are fallbacks, and
+// they are generous ON PURPOSE: that page's script first notes in shared
+// storage that a phone sign-in just completed (platform phoneRecovery,
+// 2026-11-19 — how a stuck Phone page knows to stop signing in over and
+// over), and on a slow PC it can run well after the page has loaded. Closing
+// the window under it would lose that note. GRACE counts from the page's
+// load, BACKSTOP from the start of the navigation to it (however the page
+// ended). Until then the window just shows "Phone sign-in complete".
+const LOGIN_DONE_GRACE_MS: u64 = 3000;
+const LOGIN_BACKSTOP_MS: u64 = 10000;
 
 // The Phone page's softphone teardown, run in-page before its web view goes
 // away. The page wraps connect.core.terminate() so it also removes the CCP
@@ -1588,11 +1595,11 @@ fn decide_new_window(app: &AppHandle, from: &str, url: Url) -> NewWindowResponse
 /// left to close and the sign-in gets a fresh window.
 ///
 /// Once the sign-in lands on /voice/signin-complete the shell closes the
-/// window itself (v0.3.1): after that page has loaded (plus a short grace for
-/// its script), at once if the page calls window.close() itself — which
-/// otherwise destroys only wry's inner view and leaves an empty frame on
-/// screen — and, failing both, a few seconds after it landed. Runs on the
-/// main thread.
+/// window itself (v0.3.1): at once when the page calls window.close() itself
+/// (the normal case — that otherwise destroys only wry's inner view and
+/// leaves an empty frame on screen), else a few seconds after that page has
+/// loaded (time for its script to note the completed sign-in), and, failing
+/// both, a few seconds after it landed. Runs on the main thread.
 fn open_login_window(app: &AppHandle, url: Url) {
     if EXITING.load(Ordering::SeqCst) {
         return;
