@@ -84,34 +84,48 @@ pub const MIN_GAP: Duration = Duration::from_millis(700);
 /// Right after VISTA's call goes live, a headset may briefly report on-hook
 /// (the tSIP softphone project saw it on Jabra Link adapters). Not a hang-up.
 pub const SETTLE: Duration = Duration::from_millis(1200);
-/// A hook change that only repeats the Off-Hook light we just set is the
-/// headset's echo of our own light, not a press.
-pub const ECHO: Duration = Duration::from_millis(400);
+/// The page's call signals come in bursts: a ring starts as "call active" a
+/// moment before "ringing", and a missed ring ends the same way round. The
+/// headset hears the state once it has held still this long.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const STATE_SETTLE: Duration = Duration::from_millis(250);
 
 /// Turns one device's Hook Switch reports into presses.
 ///
-/// Headsets disagree on what the bit means: Teams-style ones report the hook
-/// state the host last set plus the person's change, others flip it on every
-/// press. So any CHANGE of the bit is one press; what the press does is
-/// decided by VISTA's call state, never by the bit's value.
+/// Teams-style headsets keep a hook state that follows the Off-Hook light the
+/// host sets, and flip it when the person presses. So a change is a press only
+/// when the headset now DIFFERS from the light we set; a change that merely
+/// catches up with our light (sooner or later, even inside a report about
+/// Mute) is not. The worst case is a lost tap, never a call hung up by
+/// another button. A momentary (relative) Hook Switch counts its press only,
+/// not its release. What a press does is decided by VISTA's call state, never
+/// by the bit's value.
 #[derive(Debug, Default)]
 pub struct HookTracker {
     last: Option<bool>,
-    sent: Option<(bool, Instant)>,
+    light: bool,
     live_since: Option<Instant>,
+    momentary: bool,
 }
 
 impl HookTracker {
-    /// What the device is assumed to report right now. Called when it is
-    /// opened (with the Off-Hook light we set at once), so the very first
-    /// press after the app starts is not lost.
+    /// `momentary`: the Hook Switch is a relative control (press, release).
+    pub fn new(momentary: bool) -> Self {
+        HookTracker {
+            momentary,
+            ..Default::default()
+        }
+    }
+
+    /// What the device is assumed to report right now: on-hook when VISTA
+    /// first opens it, so the very first press after the app starts counts.
     pub fn assume(&mut self, off_hook: bool) {
         self.last = Some(off_hook);
     }
 
-    /// The Off-Hook light was just set to `off_hook`.
-    pub fn sent(&mut self, off_hook: bool, now: Instant) {
-        self.sent = Some((off_hook, now));
+    /// The Off-Hook light is now `off_hook`.
+    pub fn sent(&mut self, off_hook: bool) {
+        self.light = off_hook;
     }
 
     /// VISTA's call went live (`true`) or is over (`false`).
@@ -128,13 +142,14 @@ impl HookTracker {
         if prev == off_hook {
             return false; // unchanged: the report was about another control
         }
-        if let Some((sent, at)) = self.sent {
-            if sent == off_hook && now.duration_since(at) < ECHO {
-                // The headset now matches the light we set: its state really
-                // changed, but nobody pressed anything.
-                self.last = Some(off_hook);
-                return false;
-            }
+        if self.momentary {
+            self.last = Some(off_hook);
+            return off_hook; // the press, not the release
+        }
+        if off_hook == self.light {
+            // The headset caught up with the light we set: nobody pressed.
+            self.last = Some(off_hook);
+            return false;
         }
         if let Some(at) = self.live_since {
             if !off_hook && now.duration_since(at) < SETTLE {
@@ -301,7 +316,7 @@ fn fire(app: &AppHandle, press: Press, source: &str) {
 #[cfg(windows)]
 mod hid {
     use super::{fire, lights_for, log, CallState, HookTracker, Lights, Press};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
@@ -408,15 +423,20 @@ mod hid {
         busy_bit: bool,
         drop_bit: bool,
         flash_bit: bool,
+        /// The lights last set (None: never set since opened = all off).
         lights: Option<Lights>,
         state: CallState,
+        /// What each input report last showed, so the log keeps only changes.
+        logged: HashMap<u8, String>,
     }
 
     struct Device {
         path: String,
         name: String,
+        opened: Instant,
         read: Handle,
-        write: Handle,
+        /// None: Windows let us read the headset but not set its lights.
+        write: Option<Handle>,
         pre: Preparsed,
         caps: HIDP_CAPS,
         hook: Option<InputAt>,
@@ -430,6 +450,33 @@ mod hid {
 
     static DEVICES: Mutex<Vec<Arc<Device>>> = Mutex::new(Vec::new());
     static TX: OnceLock<Mutex<mpsc::Sender<CallState>>> = OnceLock::new();
+    /// The headset's own mute during the current call, by device path, so a
+    /// headset re-detected mid-call (unplug, wake) is never un-muted by us.
+    static MUTE_BY_PATH: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+    /// Headsets whose reads failed right after opening: left alone a while.
+    static COOLDOWN: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+    fn remembered_mute(path: &str) -> bool {
+        MUTE_BY_PATH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(path).copied())
+            .unwrap_or(false)
+    }
+
+    fn remember_mute(path: &str, mute: Option<bool>) {
+        let mut guard = MUTE_BY_PATH.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        match mute {
+            Some(m) => {
+                map.insert(path.to_string(), m);
+            }
+            None => {
+                map.remove(path);
+            }
+        }
+    }
 
     pub fn start(app: AppHandle) {
         let (tx, rx) = mpsc::channel::<CallState>();
@@ -454,11 +501,19 @@ mod hid {
         let mut last_scan: Option<Instant> = None;
         loop {
             match rx.recv_timeout(RESCAN) {
-                Ok(state) => {
-                    current = state;
-                    let devices = DEVICES.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    for dev in devices {
-                        apply(&dev, state);
+                Ok(mut state) => {
+                    // The page's signals arrive in bursts (a ring starts as
+                    // "call active" a moment before "ringing"): act on the
+                    // state once it has held still for STATE_SETTLE.
+                    while let Ok(next) = rx.recv_timeout(super::STATE_SETTLE) {
+                        state = next;
+                    }
+                    if state != current {
+                        current = state;
+                        let devices = DEVICES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        for dev in devices {
+                            apply(&dev, state);
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -475,26 +530,39 @@ mod hid {
     fn apply(dev: &Device, state: CallState) {
         let now = Instant::now();
         let mut st = dev.st.lock().unwrap_or_else(|e| e.into_inner());
-        if state.active != st.state.active {
-            st.hook.call_live(state.active, now);
-            if !state.active {
-                st.mute = false; // every call starts unmuted
+        if state != st.state {
+            if state.active != st.state.active {
+                st.hook.call_live(state.active, now);
             }
+            // Every ring and every call starts unmuted.
+            st.mute = false;
+            remember_mute(&dev.path, None);
         }
         st.state = state;
         let lights = lights_for(state, st.mute);
-        write_lights(dev, &mut st, lights, now, false);
+        write_lights(dev, &mut st, lights, false);
     }
 
     /// Set the headset's lights. `force` sends them even when unchanged: a
     /// re-assert after a press, so a headset that flipped its own hook state
-    /// (a press the page didn't act on) comes back in step with VISTA.
-    fn write_lights(dev: &Device, st: &mut DevState, lights: Lights, now: Instant, force: bool) {
-        if (!force && st.lights == Some(lights)) || dev.outputs.is_empty() {
-            st.lights = Some(lights);
+    /// (a press the page didn't act on) comes back in step with VISTA. While
+    /// VISTA is idle and has set nothing, nothing is sent: another app (Teams)
+    /// may be using the headset, and an all-off report could cut its call.
+    fn write_lights(dev: &Device, st: &mut DevState, lights: Lights, force: bool) {
+        let before = st.lights.unwrap_or_default();
+        let idle = Lights::default();
+        if lights == before && (!force || lights == idle) {
             return;
         }
+        let Some(write) = dev.write.as_ref().filter(|_| !dev.outputs.is_empty()) else {
+            // No lights to set: VISTA's call state still tells the hook
+            // tracker what a "catching up" report would look like.
+            st.lights = Some(lights);
+            st.hook.sent(lights.off_hook);
+            return;
+        };
         let len = dev.caps.OutputReportByteLength as usize;
+        let mut any_ok = false;
         for out in &dev.outputs {
             let mut buf = vec![0u8; len];
             // SAFETY: buffer sized OutputReportByteLength; preparsed data alive.
@@ -538,27 +606,32 @@ mod hid {
                 }
             }
             // SAFETY: the write handle is open; buffer is a whole report.
-            let ok = unsafe { HidD_SetOutputReport(dev.write.0, buf.as_ptr().cast(), len as u32) };
-            if !ok {
-                let first = windows::core::Error::from_win32().message();
-                // Some adapters take output reports only on their interrupt
-                // endpoint: the same report through WriteFile.
-                // SAFETY: synchronous write of a whole report on our handle.
-                if let Err(e) = unsafe { WriteFile(dev.write.0, Some(&buf), None, None) } {
-                    log(format!(
-                        "{}: lights not accepted (report {}): {first}; {}",
-                        dev.name,
-                        out.report_id,
-                        e.message()
-                    ));
-                }
+            if unsafe { HidD_SetOutputReport(write.0, buf.as_ptr().cast(), len as u32) } {
+                any_ok = true;
+                continue;
             }
+            let first = windows::core::Error::from_win32().message();
+            // Some adapters take output reports only on their interrupt
+            // endpoint (SET_REPORT is optional): the same report via WriteFile.
+            // SAFETY: synchronous write of a whole report on our own handle.
+            match unsafe { WriteFile(write.0, Some(&buf), None, None) } {
+                Ok(()) => any_ok = true,
+                Err(e) => log(format!(
+                    "{}: lights not accepted (report {}): {first}; {}",
+                    dev.name,
+                    out.report_id,
+                    e.message()
+                )),
+            }
+        }
+        if !any_ok {
+            return; // nothing changed on the headset: keep what we knew
         }
         log(format!(
             "{}: lights ring={} off_hook={} mute={}",
             dev.name, lights.ring, lights.off_hook, lights.mute
         ));
-        st.hook.sent(lights.off_hook, now);
+        st.hook.sent(lights.off_hook);
         st.lights = Some(lights);
     }
 
@@ -642,9 +715,15 @@ mod hid {
             .iter()
             .map(|d| d.path.clone())
             .collect();
+        let cooling: HashSet<String> = {
+            let mut guard = COOLDOWN.lock().unwrap_or_else(|e| e.into_inner());
+            let map = guard.get_or_insert_with(HashMap::new);
+            map.retain(|_, until| *until > Instant::now());
+            map.keys().cloned().collect()
+        };
         for path in hid_paths() {
             let key = String::from_utf16_lossy(&path[..path.len() - 1]).to_lowercase();
-            if open_paths.contains(&key) || not_headsets.contains(&key) {
+            if open_paths.contains(&key) || not_headsets.contains(&key) || cooling.contains(&key) {
                 continue;
             }
             match inspect(&path, &key, warned) {
@@ -653,10 +732,21 @@ mod hid {
                     let dev: Arc<Device> = Arc::from(dev);
                     log(describe(&dev));
                     {
+                        // Seen mid-call (a replug, a wake): it keeps the mute
+                        // the person chose, and the state of the call.
                         let mut st = dev.st.lock().unwrap_or_else(|e| e.into_inner());
                         st.hook.assume(current.active);
+                        st.state = current;
+                        st.mute = current.active && remembered_mute(&key);
+                        if current.active {
+                            st.hook.call_live(true, Instant::now());
+                            let lights = lights_for(current, st.mute);
+                            write_lights(&dev, &mut st, lights, false);
+                        } else if current.ringing {
+                            let lights = lights_for(current, false);
+                            write_lights(&dev, &mut st, lights, false);
+                        }
                     }
-                    apply(&dev, current);
                     DEVICES
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -732,9 +822,9 @@ mod hid {
             attrs.ProductID
         );
         // Two handles: a ReadFile waiting on one would hold up the lights on
-        // the same (synchronous) handle.
-        let access = GENERIC_READ.0 | GENERIC_WRITE.0;
-        let (Some(read), Some(write)) = (open(path, access), open(path, access)) else {
+        // the same (synchronous) handle. Reading needs read access only; if
+        // Windows refuses the write handle, the button still works unlit.
+        let Some(read) = open(path, GENERIC_READ.0) else {
             // Logged once per headset; tried again on every scan.
             if warned.insert(key.to_string()) {
                 log(format!(
@@ -743,6 +833,12 @@ mod hid {
             }
             return Inspect::Unavailable;
         };
+        let write = open(path, GENERIC_READ.0 | GENERIC_WRITE.0);
+        if write.is_none() {
+            log(format!(
+                "{name}: its lights can't be set (no write access); the button still works"
+            ));
+        }
         let inputs = button_caps(HidP_Input, caps.NumberInputButtonCaps, &pre);
         let outputs = button_caps(HidP_Output, caps.NumberOutputButtonCaps, &pre);
         let find = |page: u16, usage: u16| {
@@ -773,13 +869,15 @@ mod hid {
             outs[at].mute |= covers(c, LED_MUTE);
         }
         outs.retain(|o| o.ring || o.off_hook || o.mute);
+        let hook = find(PAGE_TELEPHONY, TEL_HOOK_SWITCH);
         Inspect::Found(Box::new(Device {
             path: key.to_string(),
             name,
+            opened: Instant::now(),
             read,
             write,
             caps,
-            hook: find(PAGE_TELEPHONY, TEL_HOOK_SWITCH),
+            hook,
             mute: find(PAGE_TELEPHONY, TEL_PHONE_MUTE),
             busy: find(PAGE_TELEPHONY, TEL_LINE_BUSY_TONE),
             drop: find(PAGE_TELEPHONY, TEL_DROP),
@@ -787,7 +885,7 @@ mod hid {
             outputs: outs,
             pre,
             st: Mutex::new(DevState {
-                hook: HookTracker::default(),
+                hook: HookTracker::new(hook.is_some_and(|h| !h.absolute)),
                 mute: false,
                 mute_bit: false,
                 busy_bit: false,
@@ -795,6 +893,7 @@ mod hid {
                 flash_bit: false,
                 lights: None,
                 state: CallState::default(),
+                logged: HashMap::new(),
             }),
         }))
     }
@@ -849,7 +948,7 @@ mod hid {
             })
             .collect();
         format!(
-            "found {} (telephony usage {:#04x}; input {} B, output {} B): hook switch {}, phone mute {}, line busy {}, drop {}, flash {}; lights [{}]",
+            "found {} (telephony usage {:#04x}; input {} B, output {} B): hook switch {}, phone mute {}, line busy {}, drop {}, flash {}; lights [{}]{}",
             dev.name,
             dev.caps.Usage,
             dev.caps.InputReportByteLength,
@@ -859,7 +958,8 @@ mod hid {
             at(dev.busy),
             at(dev.drop),
             at(dev.flash),
-            outs.join("; ")
+            outs.join("; "),
+            if dev.write.is_none() { " (lights unavailable)" } else { "" }
         )
     }
 
@@ -874,9 +974,19 @@ mod hid {
             // SAFETY: open handle; buffer sized to a whole input report.
             if let Err(e) = unsafe { ReadFile(dev.read.0, Some(&mut buf), Some(&mut n), None) } {
                 log(format!("{}: gone ({})", dev.name, e.message()));
+                if dev.opened.elapsed() < Duration::from_secs(5) {
+                    // Failing straight away: leave it alone for a minute
+                    // instead of reopening (and re-logging) it every scan.
+                    COOLDOWN
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(HashMap::new)
+                        .insert(dev.path.clone(), Instant::now() + Duration::from_secs(60));
+                }
                 break;
             }
             if n == 0 {
+                std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
             on_report(&app, &dev, &mut buf[..n as usize], max);
@@ -939,22 +1049,21 @@ mod hid {
     fn on_report(app: &AppHandle, dev: &Arc<Device>, report: &mut [u8], max: u32) {
         let report_id = report.first().copied().unwrap_or(0);
         let everything = all_pressed(dev, report, max);
-        let Some(tel) = pressed(dev, report, max) else {
-            log(format!("{}: report {report_id} [{everything}]", dev.name));
-            return;
-        };
-        let has = |u: u16| tel.contains(&u);
-        let mine = |a: Option<InputAt>| a.is_some_and(|a| a.report_id == report_id);
+        let tel = pressed(dev, report, max);
+        let has = |u: u16| tel.as_ref().is_some_and(|t| t.contains(&u));
+        let mine =
+            |a: Option<InputAt>| tel.is_some() && a.is_some_and(|a| a.report_id == report_id);
         let now = Instant::now();
+        // Reject / Drop first: when one report carries both, the gate keeps
+        // the first press, and passing a call on must win over answering it.
         let mut presses: Vec<Press> = Vec::new();
         let mut st = dev.st.lock().unwrap_or_else(|e| e.into_inner());
-        log(format!(
-            "{}: report {report_id} [{everything}] (ringing={} active={})",
-            dev.name, st.state.ringing, st.state.active
-        ));
-        if mine(dev.hook) && st.hook.report(has(TEL_HOOK_SWITCH), now) {
-            presses.push(Press::Call);
+        // The log keeps a report only when it shows something new.
+        let changed = st.logged.get(&report_id) != Some(&everything);
+        if changed {
+            st.logged.insert(report_id, everything.clone());
         }
+        let state = st.state;
         if mine(dev.busy) {
             let bit = has(TEL_LINE_BUSY_TONE);
             if bit && !st.busy_bit {
@@ -969,34 +1078,45 @@ mod hid {
             }
             st.drop_bit = bit;
         }
+        if mine(dev.hook) && st.hook.report(has(TEL_HOOK_SWITCH), now) {
+            presses.push(Press::Call);
+        }
+        let mut flash = false;
         if mine(dev.flash) {
             let bit = has(TEL_FLASH);
-            if bit && !st.flash_bit {
-                // Poly's 2-second Mute press ("hold" / "switch calls"): logged
-                // only. Holding a call from the headset is not a VISTA feature.
-                log(format!("{}: flash (hold) pressed: not used", dev.name));
-            }
+            // Poly's 2-second Mute press ("hold" / "switch calls"): logged
+            // only. Holding a call from the headset is not a VISTA feature.
+            flash = bit && !st.flash_bit;
             st.flash_bit = bit;
         }
         if mine(dev.mute) {
             let bit = has(TEL_PHONE_MUTE);
-            let absolute = dev.mute.is_some_and(|a| a.absolute);
-            let before = st.mute;
-            if absolute {
-                // An on/off control reports the state itself.
-                st.mute = bit;
-            } else if bit && !st.mute_bit {
-                st.mute = !st.mute;
+            // Mute only means something on a live call; between calls it is
+            // ignored (every call starts unmuted).
+            if st.state.active {
+                let absolute = dev.mute.is_some_and(|a| a.absolute);
+                let before = st.mute;
+                if absolute {
+                    st.mute = bit; // an on/off control reports the state itself
+                } else if bit && !st.mute_bit {
+                    st.mute = !st.mute;
+                }
+                if st.mute != before {
+                    remember_mute(&dev.path, Some(st.mute));
+                    // Echo the headset's own mute back to it (owner 2026-11-20:
+                    // mute stays on the headset; VISTA's screen doesn't mirror it).
+                    let lights = lights_for(st.state, st.mute);
+                    write_lights(dev, &mut st, lights, false);
+                }
             }
             st.mute_bit = bit;
-            if st.mute != before && st.state.active {
-                // Echo the headset's own mute back to it (owner 2026-11-20:
-                // mute stays on the headset; VISTA's screen doesn't mirror it).
-                let lights = lights_for(st.state, st.mute);
-                write_lights(dev, &mut st, lights, now, false);
-            }
         }
-        if presses.contains(&Press::Call) && st.state.ringing && !st.state.active {
+        if presses.contains(&Press::Call)
+            && !presses.contains(&Press::Reject)
+            && !presses.contains(&Press::Drop)
+            && st.state.ringing
+            && !st.state.active
+        {
             // Answering: tell the headset at once, as Teams does. A headset
             // waiting for that answer could otherwise drop back on-hook before
             // the call connects, which would read as a second press.
@@ -1006,9 +1126,18 @@ mod hid {
                 off_hook: true,
                 mute: false,
             };
-            write_lights(dev, &mut st, lights, now, false);
+            write_lights(dev, &mut st, lights, false);
         }
         drop(st);
+        if changed || !presses.is_empty() {
+            log(format!(
+                "{}: report {report_id} [{everything}] (ringing={} active={})",
+                dev.name, state.ringing, state.active
+            ));
+        }
+        if flash {
+            log(format!("{}: flash (hold) pressed: not used", dev.name));
+        }
         if presses.is_empty() {
             return;
         }
@@ -1026,7 +1155,7 @@ mod hid {
                     return;
                 }
                 let lights = lights_for(st.state, st.mute);
-                write_lights(&resync, &mut st, lights, Instant::now(), true);
+                write_lights(&resync, &mut st, lights, true);
             });
         for press in presses {
             fire(app, press, "usb headset");
@@ -1126,27 +1255,11 @@ mod call_control {
     /// How often to look again for a Bluetooth headset that wasn't there.
     const RETRY: Duration = Duration::from_secs(15);
 
-    fn run(app: AppHandle, rx: mpsc::Receiver<CallState>) {
-        // SAFETY: initializes COM/WinRT for this thread only (multithreaded).
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        // The headset may be off or not connected when VISTA starts: keep
-        // looking (quietly after the first time), following the call state.
-        let mut prev = CallState::default();
-        let mut quiet = false;
-        let cc = loop {
-            if let Some(cc) = find(quiet) {
-                break cc;
-            }
-            if !quiet {
-                log("callcontrol: nothing to use yet (no Bluetooth hands-free headset, or Windows said no); looking again every 15 s");
-                quiet = true;
-            }
-            match rx.recv_timeout(RETRY) {
-                Ok(state) => prev = state,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-        };
+    /// Listen to one CallControl. A Bluetooth headset rejects a ring with the
+    /// same hang-up command it uses to end a call (Voyager Legend: hold the
+    /// call button 2 s, or say "ignore"), so HangUp is a Drop: it passes a
+    /// ringing call on and hangs up a live one.
+    fn attach(app: &AppHandle, cc: &CallControl) {
         let a = app.clone();
         let _ = cc.AnswerRequested(&CallControlEventHandler::new(move |_| {
             fire(&a, Press::Call, "bluetooth answer");
@@ -1154,7 +1267,7 @@ mod call_control {
         }));
         let a = app.clone();
         let _ = cc.HangUpRequested(&CallControlEventHandler::new(move |_| {
-            fire(&a, Press::Call, "bluetooth hang-up");
+            fire(&a, Press::Drop, "bluetooth hang-up");
             Ok(())
         }));
         let _ = cc.AudioTransferRequested(&CallControlEventHandler::new(|_| {
@@ -1174,36 +1287,95 @@ mod call_control {
             Ok(())
         }));
         log("callcontrol: listening");
+    }
+
+    fn run(app: AppHandle, rx: mpsc::Receiver<CallState>) {
+        // SAFETY: initializes COM/WinRT for this thread only (multithreaded).
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let mut prev = CallState::default();
+        let mut cc: Option<CallControl> = find(false);
+        match &cc {
+            Some(c) => attach(&app, c),
+            None => log("callcontrol: nothing to use yet (no Bluetooth hands-free headset, or Windows said no); looking again every 15 s and on each ring"),
+        }
         let mut token: Option<u64> = None;
-        for state in rx {
-            if state.ringing && !state.active && !prev.ringing && token.is_none() {
-                // No headset ringer: Amazon's ring already plays in the ear.
-                match cc.IndicateNewIncomingCall(false, &HSTRING::new()) {
-                    Ok(t) => {
-                        token = Some(t);
-                        log("callcontrol: told Windows a call is ringing");
+        loop {
+            // The headset may be off when VISTA starts, or reconnect later:
+            // look again every RETRY while there is none.
+            let wait = if cc.is_some() {
+                Duration::from_secs(3600)
+            } else {
+                RETRY
+            };
+            let mut state = match rx.recv_timeout(wait) {
+                Ok(s) => s,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if cc.is_none() {
+                        cc = find(true);
+                        if let Some(c) = &cc {
+                            attach(&app, c);
+                        }
                     }
-                    Err(e) => log(format!("callcontrol: ringing not accepted ({})", err(&e))),
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
+            // Act once the page's burst of signals has settled (a ring starts
+            // as "call active" a moment before "ringing").
+            while let Ok(next) = rx.recv_timeout(super::STATE_SETTLE) {
+                state = next;
+            }
+            if state == prev {
+                continue;
+            }
+            if state.ringing && !state.active && !prev.ringing && token.is_none() {
+                // A new ring: (re)find the headset if it wasn't usable.
+                if cc.is_none() {
+                    cc = find(true);
+                    if let Some(c) = &cc {
+                        attach(&app, c);
+                    }
+                }
+                // No headset ringer: Amazon's ring already plays in the ear.
+                if let Some(c) = &cc {
+                    match c.IndicateNewIncomingCall(false, &HSTRING::new()) {
+                        Ok(t) => {
+                            token = Some(t);
+                            log("callcontrol: told Windows a call is ringing");
+                        }
+                        Err(e) => {
+                            log(format!(
+                                "callcontrol: ringing not accepted ({}); looking again",
+                                err(&e)
+                            ));
+                            cc = None; // stale (the headset went away): look again next ring
+                        }
+                    }
                 }
             }
             if state.active && !prev.active {
-                if token.is_none() {
-                    token = cc.IndicateNewOutgoingCall().ok();
-                }
-                if let Some(t) = token {
-                    match cc.IndicateActiveCall(t) {
-                        Ok(()) => log("callcontrol: told Windows the call is live"),
-                        Err(e) => log(format!("callcontrol: live call not accepted ({})", err(&e))),
+                if let Some(c) = &cc {
+                    if token.is_none() {
+                        token = c.IndicateNewOutgoingCall().ok();
+                    }
+                    if let Some(t) = token {
+                        match c.IndicateActiveCall(t) {
+                            Ok(()) => log("callcontrol: told Windows the call is live"),
+                            Err(e) => {
+                                log(format!("callcontrol: live call not accepted ({})", err(&e)))
+                            }
+                        }
                     }
                 }
             }
             if !state.ringing && !state.active {
-                if let Some(t) = token.take() {
-                    match cc.EndCall(t) {
+                if let (Some(c), Some(t)) = (&cc, token.take()) {
+                    match c.EndCall(t) {
                         Ok(()) => log("callcontrol: told Windows the call is over"),
                         Err(e) => log(format!("callcontrol: end not accepted ({})", err(&e))),
                     }
                 }
+                token = None;
             }
             prev = state;
         }
@@ -1223,7 +1395,7 @@ mod tests {
     #[test]
     fn first_report_after_assume_counts() {
         let t0 = Instant::now();
-        let mut h = HookTracker::default();
+        let mut h = HookTracker::new(false);
         h.assume(false);
         assert!(h.report(true, at(t0, 0)), "idle → off-hook is a press");
     }
@@ -1231,18 +1403,22 @@ mod tests {
     #[test]
     fn unknown_start_never_presses() {
         let t0 = Instant::now();
-        let mut h = HookTracker::default();
+        let mut h = HookTracker::new(false);
         assert!(
             !h.report(true, at(t0, 0)),
             "first report only teaches the state"
         );
-        assert!(h.report(false, at(t0, 50)), "then changes count");
+        assert!(
+            !h.report(false, at(t0, 50)),
+            "back to the light (on-hook) is catching up, not a press"
+        );
+        assert!(h.report(true, at(t0, 100)), "away from the light counts");
     }
 
     #[test]
     fn unchanged_bit_is_not_a_press() {
         let t0 = Instant::now();
-        let mut h = HookTracker::default();
+        let mut h = HookTracker::new(false);
         h.assume(false);
         assert!(!h.report(false, at(t0, 10)));
         assert!(h.report(true, at(t0, 20)));
@@ -1253,27 +1429,44 @@ mod tests {
     }
 
     #[test]
-    fn echo_of_our_own_light_is_ignored() {
+    fn catching_up_with_our_light_is_never_a_press_however_late() {
         let t0 = Instant::now();
-        let mut h = HookTracker::default();
+        let mut h = HookTracker::new(false);
         h.assume(true); // on a call; the caller hangs up
-        h.sent(false, at(t0, 0));
+        h.sent(false);
         assert!(
-            !h.report(false, at(t0, 100)),
-            "the headset echoing Off-Hook = 0"
+            !h.report(false, at(t0, 30_000)),
+            "the headset following Off-Hook = 0, even 30 s later"
         );
         // A real press later is a press again.
-        assert!(h.report(true, at(t0, 2000)));
+        assert!(h.report(true, at(t0, 40_000)));
+    }
+
+    #[test]
+    fn a_mute_press_never_hangs_up() {
+        // Reviewer's case: VISTA set Off-Hook (call answered on screen); a
+        // Teams-style adapter went off-hook without a report. 40 s later the
+        // receptionist presses Mute, and that report carries Hook = 1.
+        let t0 = Instant::now();
+        let mut h = HookTracker::new(false);
+        h.assume(false);
+        h.call_live(true, at(t0, 0));
+        h.sent(true);
+        assert!(
+            !h.report(true, at(t0, 40_000)),
+            "hook = 1 inside a Mute report only catches up with our light"
+        );
+        assert!(h.report(false, at(t0, 50_000)), "a real tap still hangs up");
     }
 
     #[test]
     fn on_hook_flicker_right_after_answer_is_ignored() {
         let t0 = Instant::now();
-        let mut h = HookTracker::default();
+        let mut h = HookTracker::new(false);
         h.assume(false);
         assert!(h.report(true, at(t0, 0)), "the answering press");
         h.call_live(true, at(t0, 300));
-        h.sent(true, at(t0, 300));
+        h.sent(true);
         assert!(!h.report(false, at(t0, 600)), "flicker within SETTLE");
         assert!(
             !h.report(true, at(t0, 800)),
@@ -1288,20 +1481,38 @@ mod tests {
     #[test]
     fn hang_up_press_after_settle_counts() {
         let t0 = Instant::now();
-        let mut h = HookTracker::default();
+        let mut h = HookTracker::new(false);
         h.assume(true);
         h.call_live(true, at(t0, 0));
-        h.sent(true, at(t0, 0));
+        h.sent(true);
         assert!(h.report(false, at(t0, 5000)), "a press during the call");
     }
 
     #[test]
-    fn toggle_style_headset_presses_both_ways() {
+    fn headset_that_ignores_lights_loses_at_most_one_tap() {
+        // A toggle-style headset that never follows the host's light: after a
+        // call the caller ended, its hook bit is still "off-hook".
         let t0 = Instant::now();
-        let mut h = HookTracker::default();
+        let mut h = HookTracker::new(false);
         h.assume(false);
-        assert!(h.report(true, at(t0, 0)));
-        assert!(h.report(false, at(t0, 3000)), "the next tap flips back");
+        assert!(h.report(true, at(t0, 0)), "answers");
+        h.sent(true);
+        h.sent(false); // the caller hung up; the headset kept hook = 1
+        assert!(
+            !h.report(false, at(t0, 60_000)),
+            "first tap of the next ring is lost"
+        );
+        assert!(h.report(true, at(t0, 61_000)), "the second one answers");
+    }
+
+    #[test]
+    fn momentary_hook_counts_the_press_not_the_release() {
+        let t0 = Instant::now();
+        let mut h = HookTracker::new(true);
+        h.assume(false);
+        assert!(h.report(true, at(t0, 0)), "press");
+        assert!(!h.report(false, at(t0, 2000)), "release, even 2 s later");
+        assert!(h.report(true, at(t0, 9000)), "the next press");
     }
 
     #[test]
@@ -1345,7 +1556,8 @@ mod tests {
             Lights::default(),
             "mute never shows off a call"
         );
-        // A ring arriving while live (Amazon doesn't do this) shows the live call.
+        // Never produced by the shell (live = CALL_ACTIVE && !ringing), but if
+        // both were ever set the live call wins: no Ring light on a live call.
         assert_eq!(
             lights_for(
                 CallState {

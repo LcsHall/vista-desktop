@@ -2573,11 +2573,15 @@ fn popup_ignore(app: AppHandle, contact_id: String) {
 
 /// The headset's lights and Bluetooth call indication follow RINGING and
 /// CALL_ACTIVE. Cheap to call often (headset::sync ignores repeats).
+///
+/// The page raises CALL_ACTIVE as soon as a call starts ringing (it guards
+/// the close button and sleep), so for the headset a call is live only once
+/// it is active AND no longer ringing here.
 fn headset_sync() {
     let ringing = RINGING.lock().unwrap().is_some();
     headset::sync(headset::CallState {
         ringing,
-        active: CALL_ACTIVE.load(Ordering::SeqCst),
+        active: CALL_ACTIVE.load(Ordering::SeqCst) && !ringing,
     });
 }
 
