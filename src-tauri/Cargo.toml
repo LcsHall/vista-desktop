@@ -57,7 +57,21 @@ open = "5"
 webview2-com = "0.38"
 # Win32_System_Power = SetThreadExecutionState (hold the machine awake DURING a
 # live call so it can't sleep mid-call; released the moment the call ends).
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Power"] }
+# Headset call button (headset.rs, owner 2026-11-20): HID telephony on USB
+# headset adapters (hid.dll + device interface lists + file handles), and the
+# Windows Bluetooth experiment (Windows.Media.Devices.CallControl, COM init).
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Power",
+  "Win32_Devices_HumanInterfaceDevice",
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Storage_FileSystem",
+  "Win32_Security",
+  "Win32_System_IO",
+  "Win32_System_Com",
+  "Foundation",
+  "Media_Devices",
+] }
 
 [features]
 # This feature is used for production builds or when a dev server is

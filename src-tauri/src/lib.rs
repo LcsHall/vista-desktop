@@ -30,6 +30,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
+
+// The headset's call button answers and hangs up calls (owner 2026-11-20).
+mod headset;
 // `Manager` brings get_webview / get_window / state / manage into scope;
 // `Emitter` brings emit (title-bar notifications). Both, plus the
 // multi-webview API (WindowBuilder / WebviewBuilder / Window::add_child /
@@ -941,6 +944,7 @@ fn later_after(app: &AppHandle, ms: u64, job: impl FnOnce(&AppHandle) + Send + '
 /// voice page's job.
 fn set_call_active(app: &AppHandle, active: bool) {
     CALL_ACTIVE.store(active, Ordering::SeqCst);
+    headset_sync();
     #[cfg(windows)]
     {
         let _ = app.run_on_main_thread(move || {
@@ -1200,6 +1204,10 @@ pub fn run() {
             // already current). Without this the updater never runs.
             spawn_update_check(app.handle());
 
+            // The headset's call button (owner 2026-11-20): USB headset
+            // adapters, plus the Windows Bluetooth experiment.
+            headset::start(app.handle());
+
             Ok(())
         })
         // IPC commands invoked from the title bar (see /src/main.js).
@@ -1277,6 +1285,7 @@ fn begin_exit(app: &AppHandle, relaunch: bool) {
     }
     set_call_active(app, false);
     *RINGING.lock().unwrap() = None;
+    headset_sync(); // the headset's lights go dark with the app
     let phones = app.state::<Mutex<TabState>>().lock().unwrap().voice.clone();
     let mut any_phone = false;
     for label in &phones {
@@ -1909,6 +1918,7 @@ fn close_phone_tabs(app: &AppHandle) {
         close_tab_impl(app, &label, true);
     }
     *RINGING.lock().unwrap() = None;
+    headset_sync();
     hide_popup(app);
 }
 
@@ -1916,6 +1926,7 @@ fn close_phone_tabs(app: &AppHandle) {
 /// Shown while a call rings unless VISTA is in front with the Phone tab
 /// showing (its own caller card is enough then). Runs on the main thread.
 fn refresh_popup(app: &AppHandle) {
+    headset_sync();
     let ringing = RINGING.lock().unwrap().clone();
     let Some(info) = ringing.filter(|_| !EXITING.load(Ordering::SeqCst)) else {
         hide_popup(app);
@@ -2396,6 +2407,7 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
     if is_voice {
         // The page that announced a ring is gone, and so is its pop-up.
         *RINGING.lock().unwrap() = None;
+        headset_sync();
         hide_popup(app);
     }
     if let Some(next) = &reactivate {
@@ -2516,15 +2528,21 @@ fn popup_answer(app: AppHandle, contact_id: String) {
         let Some(label) = phone_tab_label(&app) else {
             return;
         };
-        if let Some(main) = app.get_window("main") {
-            let _ = main.unminimize();
-            let _ = main.show();
-            let _ = main.set_focus();
-        }
-        activate(&app, &label);
-        let _ = app.emit("tab:focused", serde_json::json!({ "label": label }));
+        bring_phone_tab_front(&app, &label);
         call_phone_page(&app, &label, "__VISTA_ANSWER_CALL", &contact_id);
     });
+}
+
+/// Bring VISTA to the front on the Phone tab: the pop-up's Answer, and a
+/// headset answer (owner 2026-11-20). Runs on the main thread.
+fn bring_phone_tab_front(app: &AppHandle, label: &str) {
+    if let Some(main) = app.get_window("main") {
+        let _ = main.unminimize();
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+    activate(app, label);
+    let _ = app.emit("tab:focused", serde_json::json!({ "label": label }));
 }
 
 /// Pop-up "Ignore": stop ringing here for this one call and pass it on, the
@@ -2543,11 +2561,54 @@ fn popup_ignore(app: AppHandle, contact_id: String) {
                 *ringing = None;
             }
         }
+        headset_sync();
         hide_popup(&app);
         if let Some(label) = phone_tab_label(&app) {
             call_phone_page(&app, &label, "__VISTA_IGNORE_CALL", &contact_id);
         }
     });
+}
+
+// ─── Headset call button (owner 2026-11-20; see headset.rs) ──────────
+
+/// The headset's lights and Bluetooth call indication follow RINGING and
+/// CALL_ACTIVE. Cheap to call often (headset::sync ignores repeats).
+fn headset_sync() {
+    let ringing = RINGING.lock().unwrap().is_some();
+    headset::sync(headset::CallState {
+        ringing,
+        active: CALL_ACTIVE.load(Ordering::SeqCst),
+    });
+}
+
+/// A headset button press, on the main thread. The Phone tab decides what it
+/// does (answer while ringing, hang up a plain call, pass a 2-second press
+/// on, nothing during a transfer or hold). A tap while a call rings here also
+/// brings VISTA to the front on the Phone tab, like the pop-up's Answer.
+fn on_headset_press(app: &AppHandle, press: headset::Press) {
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(label) = phone_tab_label(app) else {
+        headset::log("press: no Phone tab open, nothing to do");
+        return;
+    };
+    let ringing_id = RINGING
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|r| r.get("contactId"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let kind = headset::press_kind(press, ringing_id.is_some());
+    if kind == "call" && ringing_id.is_some() {
+        hide_popup(app);
+        bring_phone_tab_front(app, &label);
+    }
+    if let Some(wv) = app.get_webview(&label) {
+        let script = headset::press_script(kind, ringing_id.as_deref());
+        let _ = wv.eval(&script);
+    }
 }
 
 #[tauri::command]
