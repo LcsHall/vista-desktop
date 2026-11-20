@@ -320,8 +320,8 @@ mod hid {
     };
     use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, NTSTATUS};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING,
+        CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
     const PAGE_LED: u16 = 0x08;
@@ -337,6 +337,8 @@ mod hid {
     const LED_OFF_HOOK: u16 = 0x17;
     const LED_RING: u16 = 0x18;
     const RESCAN: Duration = Duration::from_secs(3);
+    /// How long after a press the headset's lights are re-asserted.
+    const RESYNC: Duration = Duration::from_millis(2000);
 
     // HidP_SetUsages writes into the report buffer; windows-rs 0.61 types that
     // buffer as a shared slice, so it gets its own binding with a mutable one.
@@ -448,6 +450,7 @@ mod hid {
     fn control(app: AppHandle, rx: mpsc::Receiver<CallState>) {
         let mut current = CallState::default();
         let mut not_headsets: HashSet<String> = HashSet::new();
+        let mut warned: HashSet<String> = HashSet::new();
         let mut last_scan: Option<Instant> = None;
         loop {
             match rx.recv_timeout(RESCAN) {
@@ -463,7 +466,7 @@ mod hid {
             }
             if last_scan.is_none_or(|t| t.elapsed() >= RESCAN) {
                 last_scan = Some(Instant::now());
-                scan(&app, &mut not_headsets, current);
+                scan(&app, &mut not_headsets, &mut warned, current);
             }
         }
     }
@@ -480,11 +483,14 @@ mod hid {
         }
         st.state = state;
         let lights = lights_for(state, st.mute);
-        write_lights(dev, &mut st, lights, now);
+        write_lights(dev, &mut st, lights, now, false);
     }
 
-    fn write_lights(dev: &Device, st: &mut DevState, lights: Lights, now: Instant) {
-        if st.lights == Some(lights) || dev.outputs.is_empty() {
+    /// Set the headset's lights. `force` sends them even when unchanged: a
+    /// re-assert after a press, so a headset that flipped its own hook state
+    /// (a press the page didn't act on) comes back in step with VISTA.
+    fn write_lights(dev: &Device, st: &mut DevState, lights: Lights, now: Instant, force: bool) {
+        if (!force && st.lights == Some(lights)) || dev.outputs.is_empty() {
             st.lights = Some(lights);
             return;
         }
@@ -534,12 +540,18 @@ mod hid {
             // SAFETY: the write handle is open; buffer is a whole report.
             let ok = unsafe { HidD_SetOutputReport(dev.write.0, buf.as_ptr().cast(), len as u32) };
             if !ok {
-                log(format!(
-                    "{}: lights not accepted (report {}): {}",
-                    dev.name,
-                    out.report_id,
-                    windows::core::Error::from_win32().message()
-                ));
+                let first = windows::core::Error::from_win32().message();
+                // Some adapters take output reports only on their interrupt
+                // endpoint: the same report through WriteFile.
+                // SAFETY: synchronous write of a whole report on our handle.
+                if let Err(e) = unsafe { WriteFile(dev.write.0, Some(&buf), None, None) } {
+                    log(format!(
+                        "{}: lights not accepted (report {}): {first}; {}",
+                        dev.name,
+                        out.report_id,
+                        e.message()
+                    ));
+                }
             }
         }
         log(format!(
@@ -608,7 +620,22 @@ mod hid {
         }
     }
 
-    fn scan(app: &AppHandle, not_headsets: &mut HashSet<String>, current: CallState) {
+    /// What one HID path turned out to be.
+    enum Inspect {
+        /// Not a telephony headset collection: never looked at again.
+        NotHeadset,
+        /// A headset (or a device not ready yet) that could not be opened
+        /// now: tried again on the next scan.
+        Unavailable,
+        Found(Box<Device>),
+    }
+
+    fn scan(
+        app: &AppHandle,
+        not_headsets: &mut HashSet<String>,
+        warned: &mut HashSet<String>,
+        current: CallState,
+    ) {
         let open_paths: HashSet<String> = DEVICES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -620,9 +647,10 @@ mod hid {
             if open_paths.contains(&key) || not_headsets.contains(&key) {
                 continue;
             }
-            match inspect(&path, &key) {
-                Some(dev) => {
-                    let dev = Arc::new(dev);
+            match inspect(&path, &key, warned) {
+                Inspect::Found(dev) => {
+                    warned.remove(&key);
+                    let dev: Arc<Device> = Arc::from(dev);
                     log(describe(&dev));
                     {
                         let mut st = dev.st.lock().unwrap_or_else(|e| e.into_inner());
@@ -638,33 +666,37 @@ mod hid {
                         .name("headset-hid-read".into())
                         .spawn(move || read_loop(app, dev));
                 }
-                None => {
+                Inspect::NotHeadset => {
                     not_headsets.insert(key);
                 }
+                Inspect::Unavailable => {}
             }
         }
     }
 
     /// Open `path` if it is a telephony headset collection.
-    fn inspect(path: &[u16], key: &str) -> Option<Device> {
+    fn inspect(path: &[u16], key: &str, warned: &mut HashSet<String>) -> Inspect {
         // Query with no access first: works on every collection, even ones
         // Windows keeps for itself (keyboards, mice), and touches nothing.
-        let query = open(path, 0)?;
+        // A failure here may be a device still being set up: try again later.
+        let Some(query) = open(path, 0) else {
+            return Inspect::Unavailable;
+        };
         let mut pre = PHIDP_PREPARSED_DATA(0);
         // SAFETY: valid handle and out-pointer.
         if !unsafe { HidD_GetPreparsedData(query.0, &mut pre) } {
-            return None;
+            return Inspect::Unavailable;
         }
         let pre = Preparsed(pre);
         let mut caps = HIDP_CAPS::default();
         // SAFETY: valid preparsed data and out-pointer.
         if unsafe { HidP_GetCaps(pre.0, &mut caps) } != HIDP_STATUS_SUCCESS {
-            return None;
+            return Inspect::Unavailable;
         }
         if caps.UsagePage != PAGE_TELEPHONY
             || !(caps.Usage == TEL_HEADSET || caps.Usage == TEL_PHONE)
         {
-            return None;
+            return Inspect::NotHeadset;
         }
         let mut attrs = HIDD_ATTRIBUTES {
             Size: std::mem::size_of::<HIDD_ATTRIBUTES>() as u32,
@@ -702,17 +734,14 @@ mod hid {
         // Two handles: a ReadFile waiting on one would hold up the lights on
         // the same (synchronous) handle.
         let access = GENERIC_READ.0 | GENERIC_WRITE.0;
-        let Some(read) = open(path, access) else {
-            log(format!(
-                "{name}: found, but it could not be opened for reading"
-            ));
-            return None;
-        };
-        let Some(write) = open(path, access) else {
-            log(format!(
-                "{name}: found, but it could not be opened for its lights"
-            ));
-            return None;
+        let (Some(read), Some(write)) = (open(path, access), open(path, access)) else {
+            // Logged once per headset; tried again on every scan.
+            if warned.insert(key.to_string()) {
+                log(format!(
+                    "{name}: found, but Windows would not open it (another app may hold it); trying again"
+                ));
+            }
+            return Inspect::Unavailable;
         };
         let inputs = button_caps(HidP_Input, caps.NumberInputButtonCaps, &pre);
         let outputs = button_caps(HidP_Output, caps.NumberOutputButtonCaps, &pre);
@@ -744,7 +773,7 @@ mod hid {
             outs[at].mute |= covers(c, LED_MUTE);
         }
         outs.retain(|o| o.ring || o.off_hook || o.mute);
-        Some(Device {
+        Inspect::Found(Box::new(Device {
             path: key.to_string(),
             name,
             read,
@@ -767,7 +796,7 @@ mod hid {
                 lights: None,
                 state: CallState::default(),
             }),
-        })
+        }))
     }
 
     fn covers(c: &HIDP_BUTTON_CAPS, usage: u16) -> bool {
@@ -907,7 +936,7 @@ mod hid {
             .join(" ")
     }
 
-    fn on_report(app: &AppHandle, dev: &Device, report: &mut [u8], max: u32) {
+    fn on_report(app: &AppHandle, dev: &Arc<Device>, report: &mut [u8], max: u32) {
         let report_id = report.first().copied().unwrap_or(0);
         let everything = all_pressed(dev, report, max);
         let Some(tel) = pressed(dev, report, max) else {
@@ -964,10 +993,41 @@ mod hid {
                 // Echo the headset's own mute back to it (owner 2026-11-20:
                 // mute stays on the headset; VISTA's screen doesn't mirror it).
                 let lights = lights_for(st.state, st.mute);
-                write_lights(dev, &mut st, lights, now);
+                write_lights(dev, &mut st, lights, now, false);
             }
         }
+        if presses.contains(&Press::Call) && st.state.ringing && !st.state.active {
+            // Answering: tell the headset at once, as Teams does. A headset
+            // waiting for that answer could otherwise drop back on-hook before
+            // the call connects, which would read as a second press.
+            st.hook.call_live(true, now);
+            let lights = Lights {
+                ring: false,
+                off_hook: true,
+                mute: false,
+            };
+            write_lights(dev, &mut st, lights, now, false);
+        }
         drop(st);
+        if presses.is_empty() {
+            return;
+        }
+        // A press the page doesn't act on (a transfer, a hold, nothing going
+        // on) may have flipped the headset's own hook state: put its lights
+        // back in step with VISTA shortly after. Not while a call rings: an
+        // answer or a pass-on is under way, and the next call state syncs.
+        let resync = Arc::clone(dev);
+        let _ = std::thread::Builder::new()
+            .name("headset-hid-resync".into())
+            .spawn(move || {
+                std::thread::sleep(RESYNC);
+                let mut st = resync.st.lock().unwrap_or_else(|e| e.into_inner());
+                if st.state.ringing && !st.state.active {
+                    return;
+                }
+                let lights = lights_for(st.state, st.mute);
+                write_lights(&resync, &mut st, lights, Instant::now(), true);
+            });
         for press in presses {
             fire(app, press, "usb headset");
         }
@@ -988,6 +1048,8 @@ mod call_control {
         KeypadPressedEventHandler, MediaDevice, RedialRequestedEventHandler,
     };
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+    use std::time::Duration;
 
     static TX: OnceLock<Mutex<mpsc::Sender<CallState>>> = OnceLock::new();
 
@@ -1010,7 +1072,13 @@ mod call_control {
     }
 
     /// The Bluetooth hands-free headset Windows uses for calls, if any.
-    fn find() -> Option<CallControl> {
+    /// `quiet` skips the per-device lines (the retries after the first look).
+    fn find(quiet: bool) -> Option<CallControl> {
+        let log = |m: String| {
+            if !quiet {
+                super::log(m);
+            }
+        };
         let mut found: Option<CallControl> = None;
         for role in [AudioDeviceRole::Communications, AudioDeviceRole::Default] {
             let name = if role == AudioDeviceRole::Communications {
@@ -1045,7 +1113,7 @@ mod call_control {
         }
         match CallControl::GetDefault() {
             Ok(cc) => {
-                log("callcontrol: GetDefault gave one");
+                log("callcontrol: GetDefault gave one".to_string());
                 if found.is_none() {
                     found = Some(cc);
                 }
@@ -1055,12 +1123,29 @@ mod call_control {
         found
     }
 
+    /// How often to look again for a Bluetooth headset that wasn't there.
+    const RETRY: Duration = Duration::from_secs(15);
+
     fn run(app: AppHandle, rx: mpsc::Receiver<CallState>) {
         // SAFETY: initializes COM/WinRT for this thread only (multithreaded).
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let Some(cc) = find() else {
-            log("callcontrol: nothing to use (not a Bluetooth hands-free headset, or Windows said no)");
-            return;
+        // The headset may be off or not connected when VISTA starts: keep
+        // looking (quietly after the first time), following the call state.
+        let mut prev = CallState::default();
+        let mut quiet = false;
+        let cc = loop {
+            if let Some(cc) = find(quiet) {
+                break cc;
+            }
+            if !quiet {
+                log("callcontrol: nothing to use yet (no Bluetooth hands-free headset, or Windows said no); looking again every 15 s");
+                quiet = true;
+            }
+            match rx.recv_timeout(RETRY) {
+                Ok(state) => prev = state,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
         };
         let a = app.clone();
         let _ = cc.AnswerRequested(&CallControlEventHandler::new(move |_| {
@@ -1089,7 +1174,6 @@ mod call_control {
             Ok(())
         }));
         log("callcontrol: listening");
-        let mut prev = CallState::default();
         let mut token: Option<u64> = None;
         for state in rx {
             if state.ringing && !state.active && !prev.ringing && token.is_none() {
