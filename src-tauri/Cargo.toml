@@ -1,6 +1,6 @@
 [package]
 name = "vista-platform"
-version = "0.3.1"
+version = "0.3.3"
 description = "Vista Platform desktop app"
 authors = ["Vista Interface"]
 edition = "2021"
@@ -57,7 +57,18 @@ open = "5"
 webview2-com = "0.38"
 # Win32_System_Power = SetThreadExecutionState (hold the machine awake DURING a
 # live call so it can't sleep mid-call; released the moment the call ends).
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Power"] }
+# The Phone-tab recovery's "only when safe" restart (v0.3.3) reads Windows idle
+# time and the shutdown flag: Win32_UI_Input_KeyboardAndMouse =
+# GetLastInputInfo, Win32_System_SystemInformation = GetTickCount,
+# Win32_UI_WindowsAndMessaging = GetSystemMetrics(SM_SHUTTINGDOWN). windows
+# 0.61 has no optional dependencies, so features never change Cargo.lock.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 # This feature is used for production builds or when a dev server is

@@ -40,6 +40,10 @@ use tauri::{
     WebviewBuilder, WebviewUrl, WindowBuilder, WindowEvent,
 };
 
+// Phone-tab self-recovery (v0.3.3): the shell's safety net for a Phone tab
+// whose page never arrived or died (see phone_recovery.rs).
+mod phone_recovery;
+
 // Production URL the first (Platform) tab loads. MUST be the Platform
 // host, not app.vistainterface.com.
 //
@@ -1195,6 +1199,8 @@ pub fn run() {
             // Initial layout once the window is on-screen (the OS may
             // adjust the size before the webviews attach).
             relayout(app.handle());
+            // Phone-tab self-recovery (v0.3.3): its watchdog and log.
+            phone_recovery::start(app.handle());
 
             // Non-blocking startup update check (silent when offline or
             // already current). Without this the updater never runs.
@@ -1323,6 +1329,12 @@ fn close_all_then_exit(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(wait));
+        // Which way this copy left, when it restarted itself (v0.3.3 log).
+        phone_recovery::note_exit(if watching {
+            "engine-timeout"
+        } else {
+            "no-engine-watch"
+        });
         finish_exit(&app);
     });
 }
@@ -1395,6 +1407,7 @@ fn on_engine_exit(
             .Environment()?
             .cast::<ICoreWebView2Environment5>()?;
         let handler = BrowserProcessExitedEventHandler::create(Box::new(move |_, _| {
+            phone_recovery::note_exit("engine-exited");
             finish_exit(&done_app);
             Ok(())
         }));
@@ -1495,6 +1508,11 @@ fn decide_new_window(app: &AppHandle, from: &str, url: Url) -> NewWindowResponse
     if EXITING.load(Ordering::SeqCst) {
         return NewWindowResponse::Deny;
     }
+    // Any bridge sentinel proves the page that sent it is running: the
+    // Phone-tab watchdog counts it as a sign of life (v0.3.3).
+    if url.as_str().starts_with(phone_recovery::SENTINEL_PREFIX) {
+        phone_recovery::page_alive(from);
+    }
     // Voice-bridge sentinels arrive as window.open() (see VOICE_BRIDGE_SCRIPT
     // beforeunload note) — consume them here, open nothing.
     if let Some(flag) = url.as_str().strip_prefix(CALL_SENTINEL) {
@@ -1537,6 +1555,9 @@ fn decide_new_window(app: &AppHandle, from: &str, url: Url) -> NewWindowResponse
             "available" | "call" | "offline" | "connecting"
         ) {
             let _ = app.emit("phone:state", serde_json::json!({ "state": state }));
+            // A softphone that reports ready cancels a pending automatic
+            // restart (v0.3.3).
+            phone_recovery::page_state(from, &state);
         }
         return NewWindowResponse::Deny;
     }
@@ -1836,6 +1857,10 @@ fn ensure_phone_tab(app: &AppHandle, company: String, user: String) {
     let Ok(url) = format!("https://{PLATFORM_HOST}/manage/{company}/voice").parse::<Url>() else {
         return;
     };
+    // A rebuild of this person's Phone tab is already on its way (v0.3.3).
+    if !phone_recovery::on_ensure(app, &owner) {
+        return;
+    }
     let (existing, current_owner) = {
         let s = app.state::<Mutex<TabState>>();
         let s = s.lock().unwrap();
@@ -1896,6 +1921,8 @@ fn pin_tab(app: &AppHandle, label: &str, owner: String) {
 /// and the pop-up. A live call is never hung up: the tab stays until it ends,
 /// and the next person's sign-in replaces it then. Runs on the main thread.
 fn close_phone_tabs(app: &AppHandle) {
+    // Stop the Phone-tab watchdog first, even if a live call keeps the tab.
+    phone_recovery::on_signed_out(app);
     if CALL_ACTIVE.load(Ordering::SeqCst) {
         return;
     }
@@ -2035,45 +2062,18 @@ fn route_new_window(app: &AppHandle, url: Url) {
     }
 }
 
-/// Hard-reconnect the softphone: force-close the (single) Phone tab and reopen
-/// a fresh one at the same URL. The voice page only fires the reconnect
-/// sentinel when NO call is live, so force-closing is safe; recreating the
-/// webview clears the wedged CCP shared worker a page reload can't. Runs on the
-/// main thread.
+/// Hard-reconnect the softphone at the page's request (the reconnect
+/// sentinel): force-close the (single) Phone tab and reopen a fresh one. The
+/// voice page only fires the sentinel when NO call is live, so force-closing is
+/// safe; recreating the webview clears the wedged CCP shared worker a page
+/// reload can't. Since v0.3.3 this goes through the Phone-tab recovery: one
+/// rebuild in flight at a time, the pinned tab rebuilt from its owner's
+/// /manage/<company>/voice (never from about:blank), in the background unless
+/// the person was looking at it, after closing a stalled sign-in window; a
+/// request that arrives while a rebuild is pending is ignored, and none is
+/// rebuilt for a person who signed out. Runs on the main thread.
 fn reconnect_voice(app: &AppHandle) {
-    // The rebuilt tab keeps its place: pinned (same owner) and in the
-    // background unless the person was looking at it (owner 2026-11-18).
-    let (voice_label, was_active, pinned_owner) = {
-        let s = app.state::<Mutex<TabState>>();
-        let s = s.lock().unwrap();
-        let label = s.voice.first().cloned();
-        let was_active = label.as_deref().is_some_and(|l| l == s.active);
-        let pinned = label
-            .as_deref()
-            .is_some_and(|l| s.pinned.iter().any(|p| p == l));
-        let owner = if pinned { s.phone_owner.clone() } else { None };
-        (label, was_active, owner)
-    };
-    let Some(label) = voice_label else { return };
-    // A stalled sign-in window belongs to the app process, not the Phone tab —
-    // close it so the rebuilt tab's sign-in starts clean (2026-10-28).
-    close_login_window(app);
-    // Capture the page URL before we tear the webview down, so we reopen the
-    // same softphone page (companyId and all).
-    let url = app.get_webview(&label).and_then(|wv| wv.url().ok());
-    close_tab_impl(app, &label, true);
-    if let Some(url) = url {
-        // Let the terminate-at-close teardown (its 700ms deferred webview drop)
-        // finish before opening the replacement, so the old CCP is fully gone
-        // and its label is out of TabState (open_tab won't dedupe onto it).
-        let app2 = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(900));
-            let a = app2.clone();
-            let _ =
-                app2.run_on_main_thread(move || open_tab_ex(&a, url, !was_active, pinned_owner));
-        });
-    }
+    phone_recovery::page_asked_reconnect(app);
 }
 
 /// Add a new content webview as a tab, make it active, and tell the
@@ -2222,6 +2222,12 @@ fn open_tab_ex(app: &AppHandle, url: Url, background: bool, pin_owner: Option<St
     #[cfg(windows)]
     attach_mic_handler(app, &label);
 
+    // Phone-tab self-recovery (v0.3.3): watch this Phone tab's page loads from
+    // now on, before its first load can finish.
+    if is_voice_url(&url) {
+        phone_recovery::attach(app, &label, pin_owner.is_some());
+    }
+
     let is_voice = is_voice_url(&url);
     let pinned = is_voice && pin_owner.is_some();
     let (index, current_active) = {
@@ -2339,6 +2345,10 @@ fn close_tab_impl(app: &AppHandle, label: &str, force: bool) {
             serde_json::json!({ "kind": "tab", "label": label }),
         );
         return;
+    }
+    if is_voice {
+        // This web view's page events are stale from here on (v0.3.3).
+        phone_recovery::on_webview_closed(label);
     }
     let reactivate = {
         let state = app.state::<Mutex<TabState>>();
