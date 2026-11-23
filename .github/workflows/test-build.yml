@@ -34,6 +34,17 @@ jobs:
         shell: bash
         run: node scripts/check-versions.mjs "v$(node -p "require('./package.json').version")"
 
+      - name: Unit tests (Phone-tab recovery rules)
+        # The pure decision rules in src-tauri/src/phone_recovery/logic.rs:
+        # page and navigation classes, the liveness judgement, the call-flag
+        # hold, backoff, the generation guard, the restart guards (idle math,
+        # cooldown and cap, ready signals) and path templates. They run in a
+        # test binary of their own (src-tauri/tests/phone_recovery_logic.rs)
+        # that links nothing of Tauri; building it also compiles the app's
+        # library, so a compile error stops here, before the release build.
+        # --locked: exactly the committed Cargo.lock.
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --test phone_recovery_logic
+
       - name: npm install
         run: npm install
 
