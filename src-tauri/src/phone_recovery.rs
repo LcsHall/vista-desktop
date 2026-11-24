@@ -23,7 +23,9 @@
 // softphone of an app run comes up; every later one in the same run stays
 // stuck. So after a dead tab VISTA restarts itself through the v0.3.1 restart
 // path (begin_exit with relaunch), but only with no call and no ring, nobody
-// at the computer for 10 minutes, Windows not shutting down, and, when the
+// at the computer for 10 minutes (an hour while any VISTA web view is on the
+// POS or an appointment checkout, the screens that can start a card-reader
+// charge: v0.3.4), Windows not shutting down, and, when the
 // failure points at the server or the network, only after a page has answered
 // again; at most once per 30 minutes and 3 times in 6 hours (kept on disk and
 // written BEFORE the restart; a failed write means no restart). Until then the
@@ -66,17 +68,18 @@ use tauri::{AppHandle, Manager, Url};
 // shared with lib.rs.
 pub(crate) use self::logic::{is_vista_id, PLATFORM_HOST, SENTINEL_PREFIX};
 use self::logic::{
-    handoff_json, history_from_read, history_json, normalize_history, parse_handoff,
-    parse_history, restart_decision, split_owner, unambiguous, utc_stamp, voice_url_for_owner,
-    Action, ContentEvt, HistoryRead, NavDone, NavStart, ProbeOutcome, RestartHold, Snapshot,
-    Trigger, Watch, PERIOD, REBUILD_GAP_MS, RESTART_CAP, RESTART_COOLDOWN_MS, RESTART_IDLE_MS,
-    TICK,
+    handoff_json, history_from_read, history_json, idle_hold, is_payment_path, normalize_history,
+    parse_handoff, parse_history, restart_decision, split_owner, unambiguous, utc_stamp,
+    voice_url_for_owner, Action, ContentEvt, HistoryRead, NavDone, NavStart, ProbeOutcome,
+    RestartHold, Snapshot, Trigger, Watch, PERIOD, REBUILD_GAP_MS, RESTART_CAP,
+    RESTART_COOLDOWN_MS, RESTART_IDLE_PAYMENT_MS, TICK,
 };
 
 use super::{
-    begin_exit, close_login_window, close_phone_tabs, close_tab_impl, ensure_phone_tab,
-    finish_exit, is_voice_url, later, later_after, open_tab_ex, phone_tab_label, refresh_popup,
-    set_call_active, TabState, CALL_ACTIVE, EXITING, EXIT_SENT, PLATFORM_TAB, RINGING,
+    begin_exit, call_or_ringing, close_login_window, close_phone_tabs, close_tab_impl,
+    ensure_phone_tab, finish_exit, is_voice_url, later, later_after, open_tab_ex, phone_tab_label,
+    refresh_popup, set_call_active, TabState, CALL_ACTIVE, EXITING, EXIT_SENT, PLATFORM_TAB,
+    RINGING,
 };
 
 static WATCH: Mutex<Watch> = Mutex::new(Watch::new());
@@ -971,6 +974,17 @@ fn platform_on_phone_page(app: &AppHandle) -> bool {
         .is_some_and(|u| is_voice_url(&u))
 }
 
+/// Any web view of the app (the Platform tab, any other tab, any window) shows
+/// a Platform screen that can start a card-reader charge (v0.3.4: the POS, an
+/// appointment checkout; logic::is_payment_path). Main thread, like every
+/// wv.url() read in lib.rs. The address is only matched, never logged.
+fn payment_page_open(app: &AppHandle) -> bool {
+    app.webviews()
+        .into_values()
+        .filter_map(|wv| wv.url().ok())
+        .any(|u| u.host_str() == Some(PLATFORM_HOST) && is_payment_path(u.path()))
+}
+
 // ─── The restart ("Only when safe") ──────────────────────────────────
 
 /// Restart now if it is safe; otherwise log why not (throttled) and let the
@@ -986,21 +1000,21 @@ fn try_restart(app: &AppHandle) {
     }
     // Read first: every decision line carries it.
     let idle = idle_ms_now();
-    let ringing = RINGING.lock().map(|r| r.is_some()).unwrap_or(true);
-    if CALL_ACTIVE.load(Ordering::SeqCst) || ringing {
+    // A call or a ring (a poisoned ring lock counts as ringing): the same test
+    // an update's install waits on (lib.rs call_or_ringing).
+    if call_or_ringing() {
         restart_held(now, "call", "", idle);
         return;
     }
-    match idle {
-        Some(ms) if ms >= RESTART_IDLE_MS => {}
-        Some(_) => {
-            restart_held(now, "active", "", idle);
-            return;
-        }
-        None => {
-            restart_held(now, "idle-unknown", "", idle);
-            return;
-        }
+    // Nobody at the computer for 10 minutes, or for an hour while any VISTA
+    // web view is on a screen that can start a card-reader charge (v0.3.4):
+    // closing it mid-charge would leave a charged card on an unpaid sale. It
+    // only ever postpones. The web views are looked at only when it can
+    // matter (under an hour idle); the hold line says "payment-page".
+    let payment = idle.is_some_and(|ms| ms < RESTART_IDLE_PAYMENT_MS) && payment_page_open(app);
+    if let Some(word) = idle_hold(idle, payment) {
+        restart_held(now, word, "", idle);
+        return;
     }
     if shutting_down() {
         restart_held(now, "shutdown", "", idle);
@@ -1041,9 +1055,9 @@ fn try_restart(app: &AppHandle) {
     }
 }
 
-/// A restart held (a call, someone at the computer, the cooldown, ...):
-/// logged at most once per reason per 10 minutes, with the idle time and the
-/// cooldown state.
+/// A restart held (a call, someone at the computer, a payment screen, the
+/// cooldown, ...): logged at most once per reason per 10 minutes, with the
+/// idle time and the cooldown state.
 fn restart_held(now: Instant, word: &str, extra: &str, idle: Option<u32>) {
     if let Some(suppressed) = with_watch(|w| w.restart_hold_due(now, word)) {
         log(held_line(word, extra, suppressed, idle));
@@ -1233,9 +1247,9 @@ pub(crate) fn log(msg: impl Into<String>) {
     }
 }
 
-/// The same, written before returning: the lines that explain a restart must
-/// reach the file before the process ends.
-fn log_sync(msg: impl Into<String>) {
+/// The same, written before returning: the lines that explain a restart (or
+/// an update's install, lib.rs) must reach the file before the process ends.
+pub(crate) fn log_sync(msg: impl Into<String>) {
     let line = stamp_line(msg.into());
     #[cfg(debug_assertions)]
     eprintln!("[phone-tab] {line}");

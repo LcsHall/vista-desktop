@@ -1,4 +1,5 @@
-//! Phone-tab self-recovery: the pure decision rules (v0.3.3).
+//! Phone-tab self-recovery: the pure decision rules (v0.3.3; the payment-screen
+//! guard on the automatic restart, v0.3.4).
 //!
 //! Plain data in, decisions out. No Tauri, no WebView2, no files and no clock
 //! of its own (every function is handed `now`), so all of it runs under
@@ -85,6 +86,10 @@ pub const NAV_MEMORY: usize = 16;
 
 /// Nobody has touched the computer for this long (Windows idle time).
 pub const RESTART_IDLE_MS: u32 = 600_000;
+/// The same while any VISTA web view shows a screen that can start a
+/// card-reader charge (v0.3.4, is_payment_path): a charge still waiting on the
+/// reader is recorded only by that page, so it gets an hour.
+pub const RESTART_IDLE_PAYMENT_MS: u32 = 3_600_000;
 /// At most one automatic restart per this long...
 pub const RESTART_COOLDOWN_MS: u64 = 30 * 60 * 1000;
 /// ...and at most RESTART_CAP of them within this long (kept on disk, so a
@@ -794,6 +799,51 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// right: a 64-bit difference would make the PC look idle forever.
 pub fn idle_ms(now_tick: u32, last_input_tick: u32) -> u32 {
     now_tick.wrapping_sub(last_input_tick)
+}
+
+// ─── Payment screens: the restart's idle check (v0.3.4) ──────────────
+
+/// A Platform path (any query or fragment ignored) of a screen that can start
+/// a card-reader (Stripe Terminal) charge. Such a screen polls the charge and
+/// is the only thing that records the sale once the client taps (the charge
+/// captures automatically), so closing it mid-charge leaves a charged card on
+/// an unpaid sale. On Platform master (2026-11-24) exactly two screens call
+/// terminal-start or reader-tip-ask: the POS (`/manage/<company>/pos`) and an
+/// appointment checkout (`/manage/<company>/checkout/<appointment>`). Any
+/// path below either counts too. Whole segments only: `/manage/x/position`,
+/// `/manage/x/pos-reports`, `/manage/x/checkouts` and `/manage/pos` are not.
+pub fn is_payment_path(path: &str) -> bool {
+    let path = path.split(&['?', '#'][..]).next().unwrap_or("");
+    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    // (A tuple's parts are evaluated left to right.)
+    let (Some("manage"), Some(_company), Some(section)) = (segs.next(), segs.next(), segs.next())
+    else {
+        return false;
+    };
+    section == "pos" || section == "checkout"
+}
+
+/// How long nobody must have touched the computer before an automatic
+/// restart: 10 minutes, or an hour while a payment screen is open.
+pub fn restart_idle_needed_ms(payment_open: bool) -> u32 {
+    if payment_open {
+        RESTART_IDLE_PAYMENT_MS
+    } else {
+        RESTART_IDLE_MS
+    }
+}
+
+/// The idle step of the restart's safety check. None: idle long enough.
+/// Otherwise the hold word: `idle-unknown` when Windows can't say (counts as
+/// not idle), `payment-page` while a payment screen is open and its hour is not
+/// up, `active` otherwise. A payment screen only ever postpones a restart.
+pub fn idle_hold(idle: Option<u32>, payment_open: bool) -> Option<&'static str> {
+    match idle {
+        None => Some("idle-unknown"),
+        Some(ms) if ms >= restart_idle_needed_ms(payment_open) => None,
+        Some(_) if payment_open => Some("payment-page"),
+        Some(_) => Some("active"),
+    }
 }
 
 // ─── The restart record (persisted) and the hand-off ─────────────────
@@ -2987,6 +3037,100 @@ mod tests {
         assert_eq!(idle_ms(5, u32::MAX - 5), 11);
         assert_eq!(idle_ms(1_000, 400), 600);
         assert_eq!(idle_ms(400, 400), 0);
+    }
+
+    // ── Payment screens (v0.3.4) ───────────────────────────────────
+
+    #[test]
+    fn payment_screens_are_matched_by_whole_segment() {
+        let appt = "9b2e8c1a-0d4f-4e6a-8b7c-1f2e3d4c5b6a";
+        let screens = [
+            format!("/manage/{COMPANY}/pos"),
+            format!("/manage/{COMPANY}/checkout/{appt}"),
+            "/manage/x/pos".to_string(),
+            "/manage/x/pos/".to_string(),
+            "/manage/x/pos/anything/below".to_string(),
+            "/manage/x/checkout".to_string(),
+            "/manage/x/checkout/".to_string(),
+            "/manage/x/checkout/y/receipt".to_string(),
+            "/manage/x/pos?saleId=1&from=invoices".to_string(),
+            "/manage/x/checkout/y#tip".to_string(),
+            "/manage/x/pos/?a=b#c".to_string(),
+        ];
+        for path in &screens {
+            assert!(is_payment_path(path), "{path}");
+        }
+        let lookalikes = [
+            "/manage/x/position",
+            "/manage/x/pos-reports",
+            "/manage/x/checkouts",
+            "/manage/pos",
+            "/manage/checkout",
+            "/manage/pos/x",
+            "/manage//pos",
+            "/manage/x/possible",
+            "/manage/x/repos",
+            "/manage/x/precheckout",
+            "/manage/x/checkout-settings",
+            "/manage/x/reports/pos",
+            "/manage/x/settings/checkout",
+            "/manage/x/voice",
+            "/manage/x",
+            "/manage",
+            "/pos",
+            "/checkout/y",
+            "/admin/x/pos",
+            "/managex/y/pos",
+            "/x/manage/y/pos",
+            "/manage/x/p?pos",
+            "/manage/x?/pos",
+            "/manage/x#/pos",
+            "/manage/x/?next=/manage/x/pos",
+            "",
+            "/",
+        ];
+        for path in lookalikes {
+            assert!(!is_payment_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_payment_screen_needs_an_hour_idle_and_only_postpones() {
+        assert_eq!(RESTART_IDLE_MS, 600_000);
+        assert_eq!(RESTART_IDLE_PAYMENT_MS, 3_600_000);
+        assert_eq!(restart_idle_needed_ms(false), RESTART_IDLE_MS);
+        assert_eq!(restart_idle_needed_ms(true), RESTART_IDLE_PAYMENT_MS);
+        // The idle step of the restart's safety check.
+        assert_eq!(idle_hold(None, false), Some("idle-unknown"));
+        assert_eq!(idle_hold(None, true), Some("idle-unknown"));
+        assert_eq!(idle_hold(Some(0), false), Some("active"));
+        assert_eq!(idle_hold(Some(599_999), false), Some("active"));
+        assert_eq!(idle_hold(Some(600_000), false), None);
+        assert_eq!(idle_hold(Some(0), true), Some("payment-page"));
+        assert_eq!(
+            idle_hold(Some(600_000), true),
+            Some("payment-page"),
+            "10 minutes is not enough with a payment screen open"
+        );
+        assert_eq!(idle_hold(Some(3_599_999), true), Some("payment-page"));
+        assert_eq!(idle_hold(Some(3_600_000), true), None);
+        assert_eq!(idle_hold(Some(u32::MAX), true), None);
+        // A payment screen never turns a hold into a restart.
+        for ms in [0, 1, 599_999, 600_000, 600_001, 3_599_999, 3_600_000, u32::MAX] {
+            let without = idle_hold(Some(ms), false);
+            let with = idle_hold(Some(ms), true);
+            assert!(without.is_none() || with.is_some(), "{ms}");
+        }
+        // Its hold line is throttled like every other one (once per reason
+        // per 10 minutes; a different reason is written at once).
+        let t0 = Instant::now();
+        let mut w = loaded(t0);
+        let _ = w.on_process_failed(secs(t0, 30), 1, 1, false);
+        assert_eq!(w.restart_hold_due(secs(t0, 100), "payment-page"), Some(0));
+        assert_eq!(w.restart_hold_due(secs(t0, 130), "payment-page"), None);
+        assert_eq!(w.restart_hold_due(secs(t0, 160), "active"), Some(1));
+        assert_eq!(w.restart_hold_due(secs(t0, 190), "payment-page"), Some(0));
+        assert_eq!(w.restart_hold_due(secs(t0, 790), "payment-page"), Some(0));
     }
 
     #[test]

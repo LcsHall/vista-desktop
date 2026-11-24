@@ -191,7 +191,7 @@ going through the Store.
 │   │   │                               #     bar + content)
 │   │   │                               #   - resize handler
 │   │   │                               #   - window-control IPC commands
-│   │   ├── phone_recovery.rs         # Phone-tab self-recovery (0.3.3):
+│   │   ├── phone_recovery.rs         # Phone-tab self-recovery (0.3.3+):
 │   │   │                               #   WebView2 load events, the
 │   │   │                               #   watchdog, rebuilds, the safe
 │   │   │                               #   restart, phone-tab.log
@@ -210,7 +210,7 @@ going through the Store.
 └── README.md                         # You are here
 ```
 
-## Phone-tab self-recovery (0.3.3)
+## Phone-tab self-recovery (0.3.3; payment-screen guard 0.3.4)
 
 All of the Phone tab's own repair logic is JavaScript in the voice page, so a
 load that fails (a load balancer 502 page, a load cut off inside the app,
@@ -234,11 +234,33 @@ was restarted. `src-tauri/src/phone_recovery.rs` is the shell's safety net:
   at the server or the network, only after a page has answered again; at
   most once per 30 minutes and 3 times in 6 hours (`phone-restarts.json`). A
   softphone that reports ready cancels it, and so do sign-out and quitting.
+- 0.3.4: while any VISTA tab or window is on the POS
+  (`/manage/<company>/pos`) or an appointment checkout
+  (`/manage/<company>/checkout/<appointment>`), the two screens that can start
+  a card-reader charge, the restart needs an hour without keyboard or mouse
+  input instead of 10 minutes (log: `restart held reason=payment-page`). A
+  charge still waiting on the reader is recorded only by that page, so
+  closing it mid-charge would leave a charged card on an unpaid sale. It
+  only ever postpones a restart.
 - No UI. The log, with path templates only (no addresses, ids or names), is
   `%LOCALAPPDATA%\com.vistainterface.platform\phone-tab.log`.
 
 The rules are unit-tested (`cargo test --test phone_recovery_logic` in
 `src-tauri`); the CI test build runs them before the release build.
+
+## Updates wait for a moment with no call (0.3.4)
+
+Install on the "Update available" box used to close VISTA at once (on
+Windows the updater starts the installer and ends the app), cutting off a live
+call. Since 0.3.4 Install downloads the update first (VISTA keeps working),
+then waits until no call is live or ringing (the automatic restart's own
+test, checked about once a second), and only then hands over to the
+installer. Quitting meanwhile drops it; the box comes back at the next
+launch. The box itself (wording, buttons) is unchanged. The install that runs
+is always the installed version's own code, so the update TO 0.3.4 still
+closes at once; updates after it are the first ones that wait. Log lines:
+`update downloaded: install waits for no call or ring`,
+`update install now waited=<s>s`, `update install dropped reason=quit`.
 
 ## Things to think about before the Store submission
 

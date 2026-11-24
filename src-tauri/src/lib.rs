@@ -932,6 +932,15 @@ static CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
 // ({contactId, name, tag, number, startedAt}) — what the pop-up shows.
 static RINGING: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 
+/// A call is live or ringing on this computer right now (a poisoned ring lock
+/// counts as ringing). The Phone-tab recovery's automatic restart
+/// (phone_recovery::try_restart) and an update's install (spawn_update_check)
+/// both wait until this is false.
+fn call_or_ringing() -> bool {
+    let ringing = RINGING.lock().map(|r| r.is_some()).unwrap_or(true);
+    CALL_ACTIVE.load(Ordering::SeqCst) || ringing
+}
+
 type MainJob = Box<dyn FnOnce(&AppHandle) + Send>;
 
 /// Run `job` on the main thread on a LATER turn of the event loop — never
@@ -1484,10 +1493,12 @@ fn restart_allowed(app: &AppHandle, from: &str, token: &str) -> bool {
 // ─── Auto-update ────────────────────────────────────────────────────────
 
 /// Check the GitHub Releases feed once at startup; on a newer signed build,
-/// offer Install/Later. Install downloads, applies, and restarts. Failure
-/// paths are deliberately silent — offline launches and 404s (no release
-/// yet) must never bother a medspa mid-checkin. Same pattern as the
-/// vista-admin cockpit, where it's verified end to end.
+/// offer Install/Later. Install downloads, waits for a moment with no call
+/// and no ring (v0.3.4), applies, and restarts. Failure paths are
+/// deliberately silent — offline launches and 404s (no release yet) must
+/// never bother a medspa mid-checkin. Same pattern as the vista-admin
+/// cockpit, where it's verified end to end. The box itself (wording and
+/// buttons) is unchanged.
 fn spawn_update_check(app: &tauri::AppHandle) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
     use tauri_plugin_updater::UpdaterExt;
@@ -1517,18 +1528,70 @@ fn spawn_update_check(app: &tauri::AppHandle) {
                     return;
                 }
                 tauri::async_runtime::spawn(async move {
-                    // On Windows the installer takes over: download_and_install
-                    // launches it and ends this process itself (so the
-                    // single-instance lock goes with it) and the installer
-                    // reopens the new version. Elsewhere it returns, and
-                    // request_restart goes through RunEvent::Exit, where the
-                    // single-instance plugin lets go before the new copy starts.
-                    if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
-                        restart_handle.request_restart();
-                    }
+                    // Download (and verify) first: VISTA keeps working
+                    // meanwhile.
+                    let Ok(bytes) = update.download(|_, _| {}, || {}).await else {
+                        phone_recovery::log("update download failed");
+                        return;
+                    };
+                    // Installing ends VISTA at once, which would cut a live
+                    // call off (v0.3.4). So wait for a moment with no call and
+                    // no ring, on a thread of its own: the wait can last a
+                    // whole call and must never hold a worker thread of the
+                    // async runtime.
+                    std::thread::spawn(move || {
+                        let Some(waited) = wait_for_no_call() else {
+                            // The app began quitting first (the person, or the
+                            // automatic restart): the box comes back at the
+                            // next launch.
+                            phone_recovery::log("update install dropped reason=quit");
+                            return;
+                        };
+                        phone_recovery::log_sync(format!(
+                            "update install now waited={}s",
+                            waited.as_secs()
+                        ));
+                        // On Windows the installer takes over: install()
+                        // launches it and ends this process itself (so the
+                        // single-instance lock goes with it) and the installer
+                        // reopens the new version. Elsewhere it returns, and
+                        // request_restart goes through RunEvent::Exit, where
+                        // the single-instance plugin lets go before the new
+                        // copy starts.
+                        if update.install(bytes).is_ok() {
+                            restart_handle.request_restart();
+                        } else {
+                            phone_recovery::log("update install failed");
+                        }
+                    });
                 });
             });
     });
+}
+
+/// How often a downloaded update looks for a moment with no call.
+const UPDATE_WAIT_POLL: Duration = Duration::from_secs(1);
+
+/// Block the calling plain thread (never the async runtime's) until no call is
+/// live or ringing (call_or_ringing, the automatic restart's own test),
+/// checking about once a second, and say how long that took. None when the
+/// app began quitting first (EXITING).
+fn wait_for_no_call() -> Option<Duration> {
+    let started = std::time::Instant::now();
+    let mut noted = false;
+    loop {
+        if EXITING.load(Ordering::SeqCst) {
+            return None;
+        }
+        if !call_or_ringing() {
+            return Some(started.elapsed());
+        }
+        if !noted {
+            noted = true;
+            phone_recovery::log("update downloaded: install waits for no call or ring");
+        }
+        std::thread::sleep(UPDATE_WAIT_POLL);
+    }
 }
 
 // ─── Tab management ─────────────────────────────────────────────────
