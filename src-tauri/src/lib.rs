@@ -59,8 +59,10 @@ mod phone_recovery;
 const PRODUCTION_URL: &str = "https://platform.vistainterface.com";
 
 // Host of the Platform app. Used to tell "internal staff page" (open as
-// a new tab) apart from "external link" (open in the system browser).
-const PLATFORM_HOST: &str = "platform.vistainterface.com";
+// a new tab) apart from "external link" (open in the system browser). One
+// definition, shared with the Phone-tab recovery (v0.3.3), so the address it
+// rebuilds and the pages it recognises can never disagree with the shell.
+const PLATFORM_HOST: &str = phone_recovery::PLATFORM_HOST;
 
 // Label of the first, non-closeable tab (the live Platform app).
 const PLATFORM_TAB: &str = "content";
@@ -755,6 +757,38 @@ const CALL_RING_OVER_SENTINEL: &str = "https://vista-desktop.invalid/__call_ring
 // restart_bridge_script() for why. No UI of its own: the web page decides
 // when to call window.__VISTA_RESTART_APP().
 const RESTART_APP_SENTINEL: &str = "https://vista-desktop.invalid/__restart_app__/";
+
+// Every bridge sentinel lives under the prefix the Phone-tab recovery (v0.3.3)
+// counts as a sign of life and never as a page load. Checked at compile time,
+// so a sentinel moved elsewhere cannot silently fall out of that.
+const fn has_prefix(s: &str, prefix: &str) -> bool {
+    let (s, p) = (s.as_bytes(), prefix.as_bytes());
+    if s.len() < p.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < p.len() {
+        if s[i] != p[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = {
+    let p = phone_recovery::SENTINEL_PREFIX;
+    assert!(has_prefix(CLOSE_SENTINEL, p));
+    assert!(has_prefix(CALL_SENTINEL, p));
+    assert!(has_prefix(AGENT_READY_SENTINEL, p));
+    assert!(has_prefix(RECONNECT_SENTINEL, p));
+    assert!(has_prefix(PHONE_ALWAYS_ON_SENTINEL, p));
+    assert!(has_prefix(PHONE_SIGNED_OUT_SENTINEL, p));
+    assert!(has_prefix(PHONE_STATE_SENTINEL, p));
+    assert!(has_prefix(CALL_RINGING_SENTINEL, p));
+    assert!(has_prefix(CALL_RING_OVER_SENTINEL, p));
+    assert!(has_prefix(RESTART_APP_SENTINEL, p));
+};
+
 // Label of the incoming-call pop-up window (local popup.html).
 const CALL_POPUP: &str = "call-popup";
 // The pop-up's size in logical pixels, and its gap from the screen corner.
@@ -883,6 +917,12 @@ static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 // Longest wait for the WebView2 engine to exit once every web view is closed
 // (normally well under a second or two). Then the app leaves anyway.
 const ENGINE_EXIT_TIMEOUT_MS: u64 = 4000;
+// The same for the Phone-tab recovery's automatic restart (v0.3.3): its whole
+// point is a fresh engine, and a relaunch that starts against the old one
+// would inherit the jam. It only runs at an idle desk, so the wait costs
+// nothing (the engine's exit still ends it at once).
+const AUTO_RESTART_ENGINE_EXIT_MS: u64 = 20_000;
+const AUTO_RESTART_NO_WATCH_MS: u64 = 3_000;
 
 // Whether a call is live right now (armed by the voice page via the call
 // sentinel; cleared on end/destroy or when the voice tab is force-closed).
@@ -1303,9 +1343,10 @@ fn begin_exit(app: &AppHandle, relaunch: bool) {
 }
 
 /// Close every web view so the WebView2 engine shuts down, then exit once it
-/// has (or after ENGINE_EXIT_TIMEOUT_MS). The main window stays, hidden, until
-/// the process exits, so Tauri doesn't quit early on "last window closed".
-/// Runs on the main thread.
+/// has (or after ENGINE_EXIT_TIMEOUT_MS; AUTO_RESTART_ENGINE_EXIT_MS for the
+/// Phone-tab recovery's automatic restart). The main window stays, hidden,
+/// until the process exits, so Tauri doesn't quit early on "last window
+/// closed". Runs on the main thread.
 fn close_all_then_exit(app: &AppHandle) {
     #[cfg(windows)]
     let watching = watch_engine_exit(app);
@@ -1321,10 +1362,11 @@ fn close_all_then_exit(app: &AppHandle) {
     for webview in app.webviews().into_values() {
         let _ = webview.close();
     }
-    let wait = if watching {
-        ENGINE_EXIT_TIMEOUT_MS
-    } else {
-        300
+    let wait = match (watching, phone_recovery::restarting()) {
+        (true, true) => AUTO_RESTART_ENGINE_EXIT_MS,
+        (true, false) => ENGINE_EXIT_TIMEOUT_MS,
+        (false, true) => AUTO_RESTART_NO_WATCH_MS,
+        (false, false) => 300,
     };
     let app = app.clone();
     std::thread::spawn(move || {
@@ -1524,7 +1566,9 @@ fn decide_new_window(app: &AppHandle, from: &str, url: Url) -> NewWindowResponse
         return NewWindowResponse::Deny;
     }
     if url.as_str().starts_with(RECONNECT_SENTINEL) {
-        later(app, reconnect_voice);
+        // Who asked matters: it force-closes the Phone tab (v0.3.3).
+        let from = from.to_string();
+        later(app, move |app| reconnect_voice(app, &from));
         return NewWindowResponse::Deny;
     }
     if let Some(token) = url.as_str().strip_prefix(RESTART_APP_SENTINEL) {
@@ -1803,9 +1847,10 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A VISTA id as the web app writes it: 36 characters of hex digits and dashes.
+/// A VISTA id as the web app writes it: 36 characters of hex digits and dashes
+/// (one rule, shared with the Phone-tab recovery).
 fn is_vista_id(s: &str) -> bool {
-    s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    phone_recovery::is_vista_id(s)
 }
 
 /// "/<companyId>/<userId>" (each URL-encoded) → the two ids, lower-cased.
@@ -2063,17 +2108,19 @@ fn route_new_window(app: &AppHandle, url: Url) {
 }
 
 /// Hard-reconnect the softphone at the page's request (the reconnect
-/// sentinel): force-close the (single) Phone tab and reopen a fresh one. The
-/// voice page only fires the sentinel when NO call is live, so force-closing is
-/// safe; recreating the webview clears the wedged CCP shared worker a page
-/// reload can't. Since v0.3.3 this goes through the Phone-tab recovery: one
-/// rebuild in flight at a time, the pinned tab rebuilt from its owner's
-/// /manage/<company>/voice (never from about:blank), in the background unless
-/// the person was looking at it, after closing a stalled sign-in window; a
-/// request that arrives while a rebuild is pending is ignored, and none is
-/// rebuilt for a person who signed out. Runs on the main thread.
-fn reconnect_voice(app: &AppHandle) {
-    phone_recovery::page_asked_reconnect(app);
+/// sentinel, sent by tab `from`): force-close the (single) Phone tab and
+/// reopen a fresh one. The voice page only fires the sentinel when NO call is
+/// live, so force-closing is safe; recreating the webview clears the wedged
+/// CCP shared worker a page reload can't. Since v0.3.3 this goes through the
+/// Phone-tab recovery: only a request from the Phone tab itself counts (the
+/// bridge runs in every tab and frame), one rebuild in flight at a time, the
+/// pinned tab rebuilt from its owner's /manage/<company>/voice (never from
+/// about:blank), in the background unless the person was looking at it, after
+/// closing a stalled sign-in window; a request that arrives while a rebuild is
+/// pending is ignored, and none is rebuilt for a person who signed out. Runs
+/// on the main thread.
+fn reconnect_voice(app: &AppHandle, from: &str) {
+    phone_recovery::page_asked_reconnect(app, from);
 }
 
 /// Add a new content webview as a tab, make it active, and tell the
@@ -2173,6 +2220,10 @@ fn open_tab_ex(app: &AppHandle, url: Url, background: bool, pin_owner: Option<St
     let nav_app = app.clone();
     let nav_label = label.clone();
     let builder = WebviewBuilder::new(label.as_str(), WebviewUrl::External(url.clone()))
+        // A tab opened in the background (the always-on Phone tab, its
+        // rebuilds) must not take the keyboard: whatever the person types in
+        // the tab they are on stays there (v0.3.3).
+        .focused(!background)
         // Tabs can themselves open further tabs / auth popups / external links.
         .on_new_window(move |u, _features| decide_new_window(&nw_app, &nw_label, u))
         // Mark the desktop app, resolve the native dialog globals the dialog

@@ -43,9 +43,16 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const NO_ANSWER_RETRY: Duration = Duration::from_secs(15);
 /// Re-probe cadence while a page is still loading.
 pub const LOADING_RETRY: Duration = Duration::from_secs(10);
-/// A page that answers nothing is rebuilt only after this long, and never
-/// while a call is flagged.
+/// A page that answers nothing is rebuilt only after this long, never while a
+/// call is flagged, and never once its softphone came up.
 pub const UNRESPONSIVE_LIMIT: Duration = Duration::from_secs(120);
+/// A call flag holds the verdict on a dead VISTA document with no app in it
+/// (no Next runtime, no softphone hook, no Streams: nothing in it can carry a
+/// call) at most this long; then the flag counts as stale (rule 2c).
+pub const HOLD_MAX_NO_APP: Duration = Duration::from_secs(180);
+/// The same for a later navigation that never commits (the document before it
+/// may live on, carrying a call, until it commits).
+pub const HOLD_MAX_STALLED: Duration = Duration::from_secs(900);
 /// An owner with no Phone tab must be seen this long before the tab is
 /// re-created (ensure_phone_tab's own replace gap is 1.5 s).
 pub const MISSING_CONFIRM: Duration = Duration::from_secs(10);
@@ -96,7 +103,8 @@ pub const HANDOFF_MAX_AGE_MS: u64 = 120_000;
 
 /// The shell's own sentinel URLs (lib.rs: the close, call and phone bridges).
 pub const SENTINEL_PREFIX: &str = "https://vista-desktop.invalid/";
-/// The Platform host (the same as lib.rs PLATFORM_HOST).
+/// The Platform host (lib.rs PLATFORM_HOST is this one; PROBE_JS spells it
+/// out too).
 pub const PLATFORM_HOST: &str = "platform.vistainterface.com";
 
 /// The liveness probe, run in the Phone tab's main frame with ExecuteScript.
@@ -502,8 +510,12 @@ pub enum DeadReason {
     /// The newest navigation committed a failure (this class) and the page
     /// has not answered a probe since.
     Silent(NavClass),
-    /// The web view never committed a document and its load is long overdue.
+    /// The web view never committed any document: its load failed without
+    /// one, or is long overdue. Whatever its address says, no page is in it.
     NeverLoaded,
+    /// A later navigation never committed and is long overdue (the document
+    /// before it may still be there behind it).
+    NavStalled,
 }
 
 impl DeadReason {
@@ -517,6 +529,7 @@ impl DeadReason {
             DeadReason::ServerError(s) => format!("server-error:{s}"),
             DeadReason::Silent(class) => format!("silent:{}", class.word()),
             DeadReason::NeverLoaded => "never-loaded".to_string(),
+            DeadReason::NavStalled => "nav-stalled".to_string(),
         }
     }
 }
@@ -602,14 +615,6 @@ pub enum Trigger {
 }
 
 impl Trigger {
-    /// No live page can be left in the tab, so a stale call flag may go.
-    pub fn definite(self) -> bool {
-        matches!(
-            self,
-            Trigger::Dead(_) | Trigger::RendererGone(_) | Trigger::Missing
-        )
-    }
-
     /// Only a confirmed dead tab ever sets the restart pending (never a page
     /// that asked, one that stopped answering, or a missing tab).
     pub fn arms_restart(self) -> bool {
@@ -627,8 +632,10 @@ impl Trigger {
     }
 }
 
-/// A death no live call could survive. While the call flag is up, only these
-/// clear it and rebuild; anything else is held (the flag may be real).
+/// A death no live call could survive: no live page can be left in the tab,
+/// so a stale call flag may go (rule 2c). While the call flag is up, only
+/// these clear it and rebuild at once; anything else is held (the flag may be
+/// real), for at most `hold_max`.
 pub fn unambiguous(t: Trigger) -> bool {
     match t {
         Trigger::Dead(r) => match r {
@@ -638,10 +645,23 @@ pub fn unambiguous(t: Trigger) -> bool {
             | DeadReason::Silent(_)
             | DeadReason::NeverLoaded => true,
             DeadReason::NoApp(status) => status.is_some_and(|s| s >= 400),
-            DeadReason::StillLoading => false,
+            DeadReason::StillLoading | DeadReason::NavStalled => false,
         },
         Trigger::RendererGone(_) | Trigger::Missing => true,
         Trigger::Unresponsive | Trigger::PageAsked => false,
+    }
+}
+
+/// How long a call flag may hold the verdict on this (not unambiguous) death
+/// before the flag counts as stale. None: as long as the flag stays up (a page
+/// that does not answer may be blocked by a dialog, still carrying a call).
+pub fn hold_max(t: Trigger) -> Option<Duration> {
+    match t {
+        Trigger::Dead(DeadReason::NoApp(_)) | Trigger::Dead(DeadReason::StillLoading) => {
+            Some(HOLD_MAX_NO_APP)
+        }
+        Trigger::Dead(DeadReason::NavStalled) => Some(HOLD_MAX_STALLED),
+        _ => None,
     }
 }
 
@@ -684,9 +704,12 @@ pub fn restart_evidence(t: Trigger, last_class: Option<NavClass>, online: Option
     }
     match t {
         Trigger::Dead(r) => match r {
-            DeadReason::Blank | DeadReason::NeverLoaded | DeadReason::StillLoading => {
-                Evidence::Engine
-            }
+            // A cut-off load (never committed) or a blank tab: the engine.
+            DeadReason::Blank | DeadReason::NeverLoaded => Evidence::Engine,
+            // A document that committed and then stalled, or a later
+            // navigation that never commits: a slow or stalled server is as
+            // likely as the engine, so wait for a page to answer first.
+            DeadReason::StillLoading | DeadReason::NavStalled => Evidence::Unclear,
             DeadReason::ErrorPage => Evidence::Network,
             DeadReason::ServerError(_) => Evidence::Server,
             DeadReason::NoApp(Some(s)) if s >= 400 => Evidence::Server,
@@ -716,7 +739,7 @@ pub fn backoff_delay(attempts: u32) -> Duration {
 
 // ─── Owners, URLs, time ──────────────────────────────────────────────
 
-/// A VISTA id as the web app writes it (the same rule as lib.rs is_vista_id).
+/// A VISTA id as the web app writes it (lib.rs is_vista_id calls this one).
 pub fn is_vista_id(s: &str) -> bool {
     s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
@@ -938,6 +961,10 @@ pub enum Action {
     FinishSignOut,
     /// Check whether a restart is safe right now, and restart if it is.
     TryRestart,
+    /// The rules held a pending restart (`word`: network, server, unclear).
+    /// The shell logs it with the idle time and the cooldown state;
+    /// `suppressed` = hold lines left out since the last one (throttle).
+    RestartHeld { word: String, suppressed: u32 },
     Log(String),
 }
 
@@ -1007,6 +1034,17 @@ struct Cur {
     strike_resources: Option<u32>,
     no_answer_since: Option<Instant>,
     hold_logged: bool,
+    /// The shell registered our NavigationStarting, ContentLoading and
+    /// NavigationCompleted handlers on this web view. Without them silence
+    /// proves nothing, so no "never loaded" or "stalled" verdict.
+    hooks_ok: bool,
+    /// The softphone came up in the current document (a probe saw its agent,
+    /// or the page said available or call): never rebuilt for not answering.
+    agent_seen: bool,
+    agent_logged: bool,
+    /// When a call flag first held this tab's dead verdict (cleared by any
+    /// sign of life, a new navigation or a commit).
+    held_since: Option<Instant>,
 }
 
 impl Cur {
@@ -1033,6 +1071,10 @@ impl Cur {
             strike_resources: None,
             no_answer_since: None,
             hold_logged: false,
+            hooks_ok: false,
+            agent_seen: false,
+            agent_logged: false,
+            held_since: None,
         }
     }
 
@@ -1062,6 +1104,46 @@ fn judge_cur(cur: &Cur, report: &ProbeReport, now: Instant) -> Verdict {
     judge_probe(report, since_nav, since_content, cur.nav_in_flight.is_some())
 }
 
+/// Silence (a probe with no answer) that is still a death. WebView2 holds a
+/// script back until a navigation commits, so a hung or cut-off load can only
+/// ever time out.
+fn silent_death(cur: &Cur, since_nav: Duration) -> Option<DeadReason> {
+    if since_nav < NAV_GRACE {
+        return None;
+    }
+    // The newest navigation committed a failure (an error page, a 5xx, a
+    // blank tab) and nothing newer started.
+    if let Some(f) = cur
+        .failed_commit
+        .filter(|f| cur.newest_real.map_or(true, |n| n == f.id))
+    {
+        return Some(DeadReason::Silent(f.class));
+    }
+    // Without our load events, or before the first real navigation start,
+    // silence proves nothing (the page may be fine and just not answering).
+    let newest = cur.newest_real?;
+    if !cur.hooks_ok {
+        return None;
+    }
+    let overdue = cur.nav_in_flight == Some(newest)
+        && cur.content_at.is_none()
+        && since_nav >= IN_FLIGHT_LIMIT;
+    if !cur.committed_any {
+        // No document ever committed in this web view: its load failed
+        // without one, or is long overdue. Whatever the address says, no page
+        // can be in it.
+        if overdue || cur.nav_in_flight.is_none() {
+            return Some(DeadReason::NeverLoaded);
+        }
+        return None;
+    }
+    // A later navigation that never commits (the old document may live on).
+    if overdue {
+        return Some(DeadReason::NavStalled);
+    }
+    None
+}
+
 /// A restart waiting until it is safe.
 #[derive(Debug, Clone)]
 struct RestartPending {
@@ -1073,18 +1155,28 @@ struct RestartPending {
     min_pending: Duration,
     last_check: Option<Instant>,
     last_hold: Option<(String, Instant)>,
+    /// Hold lines left out since the last one written.
+    suppressed: u32,
+    /// The page (this web view generation) said "offline" at this time: a
+    /// probe sent after it that sees the agent up means a break, not a jam.
+    offline_at: Option<(u64, Instant)>,
 }
 
-fn note_hold(r: &mut RestartPending, now: Instant, word: &str, detail: &str) -> Option<String> {
+/// Whether a restart-hold line for `word` is due: at most once per reason per
+/// 10 minutes. Some(n) = due, with n lines left out since the last one.
+fn hold_due(r: &mut RestartPending, now: Instant, word: &str) -> Option<u32> {
     let due = match &r.last_hold {
         Some((w, t)) => w != word || now.saturating_duration_since(*t) >= HOLD_LOG_EVERY,
         None => true,
     };
     if !due {
+        r.suppressed = r.suppressed.saturating_add(1);
         return None;
     }
     r.last_hold = Some((word.to_string(), now));
-    Some(format!("restart held reason={word}{detail}"))
+    let left_out = r.suppressed;
+    r.suppressed = 0;
+    Some(left_out)
 }
 
 /// The watchdog's whole state. Only the main thread touches it.
@@ -1149,6 +1241,17 @@ impl Watch {
         self.wanted.clone()
     }
 
+    /// Nobody is signed in for a Phone tab as far as the watchdog knows (a
+    /// sign-out is pending, or the web app never asked for one).
+    pub fn owner_gone(&self) -> bool {
+        self.signout_pending || self.wanted.is_none()
+    }
+
+    /// The generation of the Phone web view being watched.
+    pub fn cur_gen(&self) -> Option<u64> {
+        self.cur.as_ref().map(|c| c.gen)
+    }
+
     /// The pending restart's reason, if one is pending.
     pub fn restart_reason(&self) -> Option<String> {
         self.restart.as_ref().map(|r| r.trigger.word())
@@ -1159,6 +1262,8 @@ impl Watch {
         self.seq
     }
 
+    /// A probe line, throttled: the same word at most once per REPEAT_LOG
+    /// ("alive" once per HEARTBEAT_LOG).
     fn probe_line(&mut self, now: Instant, word: &str, line: String) -> Option<Action> {
         let every = if word == "alive" { HEARTBEAT_LOG } else { REPEAT_LOG };
         let due = word != self.last_probe_word
@@ -1168,27 +1273,64 @@ impl Watch {
         if !due {
             return None;
         }
+        Some(self.note_probe_line(now, word, line))
+    }
+
+    /// A probe line that is always written (a strike: it counts towards a
+    /// verdict), noted for the throttle.
+    fn note_probe_line(&mut self, now: Instant, word: &str, line: String) -> Action {
         self.last_probe_word = word.to_string();
         self.last_probe_log = Some(now);
-        Some(log_action(line))
+        log_action(line)
     }
 
     // ── Web views ──────────────────────────────────────────────────
 
-    /// A Phone web view was created (attach, inside open_tab_ex).
+    /// A Phone web view was created (attach, inside open_tab_ex). Only the
+    /// always-on tab (`watched`) ends a rebuild: a tab opened from the sidebar
+    /// meanwhile (unpinned) leaves the ticket to the open step, which adopts
+    /// it as the always-on tab.
     pub fn on_webview_created(&mut self, now: Instant, label: &str, gen: u64, watched: bool) -> Vec<Action> {
-        let mut out = vec![log_action(format!("webview create gen={gen} tab={label}"))];
+        let mut out = vec![log_action(format!(
+            "webview create gen={gen} tab={label} watched={}",
+            watched as u8
+        ))];
         self.cur = Some(Cur::new(label.to_string(), gen, now, watched));
         self.missing_since = None;
         self.engine_gone = false;
-        if let Some(rb) = self.rebuild.take() {
-            let word = match rb.stage {
-                Stage::Closing { .. } => "rebuild opened",
-                Stage::Waiting { .. } => "rebuild superseded",
-            };
-            out.push(log_action(format!("{word} id={} trigger={}", rb.id, rb.trigger.word())));
+        // A new page: "alive" counts from its own first answer (rule 2d).
+        self.alive_since = None;
+        if watched {
+            if let Some(rb) = self.rebuild.take() {
+                let word = match rb.stage {
+                    Stage::Closing { .. } => "rebuild opened",
+                    Stage::Waiting { .. } => "rebuild superseded",
+                };
+                out.push(log_action(format!(
+                    "{word} id={} gen={gen} trigger={}",
+                    rb.id,
+                    rb.trigger.word()
+                )));
+            }
         }
         out
+    }
+
+    /// Whether the shell's load-event handlers registered on web view `gen`.
+    pub fn on_hooks(&mut self, gen: u64, ok: bool) -> Vec<Action> {
+        match self.cur.as_mut() {
+            Some(c) if c.gen == gen => {
+                c.hooks_ok = ok;
+                if ok {
+                    Vec::new()
+                } else {
+                    vec![log_action(format!(
+                        "hooks incomplete gen={gen}: silence alone never counts as dead here"
+                    ))]
+                }
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// The web view is going away (close_tab_impl): its events are stale.
@@ -1246,6 +1388,7 @@ impl Watch {
             cur.nav_started = s.at;
             cur.reset_strikes();
             cur.no_answer_since = None;
+            cur.held_since = None;
             cur.next_probe_at = s.at + NAV_GRACE;
         }
         out.push(log_action(format!(
@@ -1270,6 +1413,10 @@ impl Watch {
         let newest = cur.newest_real.map_or(true, |id| id == c.id);
         if newest {
             cur.content_at = Some(c.at);
+            // A new document replaced the old one (and its softphone, if any).
+            cur.agent_seen = false;
+            cur.agent_logged = false;
+            cur.held_since = None;
             if c.error_page {
                 // The old document is gone: an error page committed in its place.
                 if cur.failed_commit.map_or(true, |f| f.id != c.id) {
@@ -1393,17 +1540,27 @@ impl Watch {
             ProbeOutcome::Json(json) => parse_probe(json),
             _ => None,
         };
+        // The softphone came up in this document.
+        if report.as_ref().is_some_and(|r| r.agent && r.is_vista()) {
+            if let Some(cur) = self.cur.as_mut() {
+                cur.agent_seen = true;
+            }
+        }
         if late {
-            // A late answer proves the renderer still answers. It is never
-            // dead evidence; an alive one counts as alive.
+            // A late ANSWER proves the renderer still answers; a late error,
+            // "null" or garbage proves nothing (it must not restart the
+            // unresponsive clock). Never dead evidence; an alive answer counts
+            // as alive.
             let verdict = match (&self.cur, &report) {
                 (Some(c), Some(r)) => Some(judge_cur(c, r, now)),
                 _ => None,
             };
             if let Some(cur) = self.cur.as_mut() {
                 cur.late_probe = None;
-                cur.no_answer_since = None;
-                cur.hold_logged = false;
+                if report.is_some() {
+                    cur.no_answer_since = None;
+                    cur.hold_logged = false;
+                }
             }
             out.push(log_action(format!(
                 "probe late gen={gen} id={id} answered={}",
@@ -1436,13 +1593,13 @@ impl Watch {
             }
             self.last_online = Some(online);
         }
-        let (verdict, strikes) = match &self.cur {
-            Some(c) => (judge_cur(c, &report, now), c.strikes),
+        let (verdict, strikes, holding) = match &self.cur {
+            Some(c) => (judge_cur(c, &report, now), c.strikes, c.held_since.is_some()),
             None => return out,
         };
         let word = verdict_word(verdict);
-        let line = format!(
-            "probe gen={gen} id={id} verdict={word} page={} next={} hook={} streams={} agent={} ready={} status={} online={} res={} strikes={strikes}",
+        let base = format!(
+            "probe gen={gen} id={id} verdict={word} page={} next={} hook={} streams={} agent={} ready={} status={} online={} res={}",
             report.page_word(),
             report.next as u8,
             report.hook as u8,
@@ -1453,12 +1610,19 @@ impl Watch {
             report.online.map_or("-", |o| if o { "1" } else { "0" }),
             report.resources.map_or_else(|| "-".to_string(), |t| t.to_string()),
         );
-        if let Some(a) = self.probe_line(now, &word, line) {
-            out.push(a);
+        // A dead answer that counts as a strike is always written (with the
+        // count after it, by on_dead_answer); repeats are throttled only while
+        // a rebuild is pending or a call flag holds the verdict.
+        let strike = matches!(verdict, Verdict::Dead(_)) && self.rebuild.is_none() && !holding;
+        if !strike {
+            if let Some(a) = self.probe_line(now, &word, format!("{base} strikes={strikes}")) {
+                out.push(a);
+            }
         }
-        // The softphone's agent arrived: the softphone works, no restart needed.
+        // The softphone's agent is up: after the page said "offline", that is
+        // a break, and the softphone works (no restart needed).
         if report.agent && report.is_vista() {
-            out.extend(self.restart_ready("agent", sent_at));
+            out.extend(self.agent_ready(gen, sent_at));
         }
         match verdict {
             Verdict::Alive => out.extend(self.on_alive(now)),
@@ -1468,7 +1632,8 @@ impl Watch {
                 }
             }
             Verdict::Dead(reason) => {
-                out.extend(self.on_dead_answer(now, reason, &report, call_active, flipped))
+                let line = if strike { Some((word, base)) } else { None };
+                out.extend(self.on_dead_answer(now, reason, &report, call_active, flipped, line))
             }
         }
         out
@@ -1480,6 +1645,7 @@ impl Watch {
             cur.reset_strikes();
             cur.no_answer_since = None;
             cur.hold_logged = false;
+            cur.held_since = None;
             cur.next_probe_at = now + PERIOD;
         }
         let cancel = match &self.rebuild {
@@ -1526,6 +1692,7 @@ impl Watch {
         report: &ProbeReport,
         call_active: bool,
         flipped: bool,
+        line: Option<(String, String)>,
     ) -> Vec<Action> {
         let mut out = Vec::new();
         self.alive_since = None;
@@ -1549,32 +1716,45 @@ impl Watch {
             }
             return out;
         }
-        let (strikes, first) = {
+        // Count the strike (None: a document still loading made progress).
+        let step = {
             let Some(cur) = self.cur.as_mut() else {
                 return out;
             };
+            let mut progressed = false;
             if reason == DeadReason::StillLoading {
                 // Still loading counts only while it makes no progress.
-                let progressed = matches!(
+                progressed = matches!(
                     (cur.strike_resources, report.resources),
                     (Some(before), Some(after)) if after > before
                 );
                 if progressed {
                     cur.reset_strikes();
                     cur.next_probe_at = now + LOADING_RETRY;
-                    return out;
+                } else {
+                    cur.strike_resources = report.resources;
                 }
-                cur.strike_resources = report.resources;
             }
-            cur.strikes += 1;
-            if cur.first_strike_at.is_none() {
-                cur.first_strike_at = Some(now);
+            if progressed {
+                None
+            } else {
+                cur.strikes += 1;
+                if cur.first_strike_at.is_none() {
+                    cur.first_strike_at = Some(now);
+                }
+                cur.next_probe_at = now + CONFIRM_GAP;
+                Some((cur.strikes, cur.first_strike_at.unwrap_or(now)))
             }
-            cur.next_probe_at = now + CONFIRM_GAP;
-            (cur.strikes, cur.first_strike_at.unwrap_or(now))
         };
-        if strikes >= 2 && now.saturating_duration_since(first) >= CONFIRM_GAP {
-            out.extend(self.verdict_dead(now, Trigger::Dead(reason), call_active));
+        if let Some((word, base)) = line {
+            let shown = step.map_or(0, |(s, _)| s);
+            let a = self.note_probe_line(now, &word, format!("{base} strikes={shown}"));
+            out.push(a);
+        }
+        if let Some((strikes, first)) = step {
+            if strikes >= 2 && now.saturating_duration_since(first) >= CONFIRM_GAP {
+                out.extend(self.verdict_dead(now, Trigger::Dead(reason), call_active));
+            }
         }
         out
     }
@@ -1582,7 +1762,7 @@ impl Watch {
     /// A probe failed or got no answer.
     fn no_answer(&mut self, now: Instant, call_active: bool, why: &str, id: u64) -> Vec<Action> {
         let mut out = Vec::new();
-        let (gen, since, silent, strikes) = {
+        let (gen, since, silent, strikes, holding, agent_seen) = {
             let Some(cur) = self.cur.as_mut() else {
                 return out;
             };
@@ -1591,38 +1771,24 @@ impl Watch {
             }
             cur.next_probe_at = now + NO_ANSWER_RETRY;
             let since_nav = now.saturating_duration_since(cur.nav_started);
-            let newest = cur.newest_real;
-            // Silence that is still a definite death: the newest navigation
-            // committed a failure and nothing newer started, or the web view
-            // never committed any document and its load is long overdue
-            // (WebView2 holds a script back until a navigation commits, so a
-            // hung or cut-off load can only ever time out).
-            let silent = if since_nav < NAV_GRACE {
-                None
-            } else if let Some(f) = cur
-                .failed_commit
-                .filter(|f| newest.map_or(true, |n| n == f.id))
-            {
-                Some(DeadReason::Silent(f.class))
-            } else if !cur.committed_any
-                && cur.nav_in_flight.is_some()
-                && since_nav >= IN_FLIGHT_LIMIT
-            {
-                Some(DeadReason::NeverLoaded)
-            } else {
-                None
-            };
             (
                 cur.gen,
                 cur.no_answer_since.unwrap_or(now),
-                silent,
+                silent_death(cur, since_nav),
                 cur.strikes,
+                cur.held_since.is_some(),
+                cur.agent_seen,
             )
         };
         let word = format!("no-answer:{why}");
-        let line = format!("probe gen={gen} id={id} verdict={word} strikes={strikes}");
-        if let Some(a) = self.probe_line(now, &word, line) {
-            out.push(a);
+        let base = format!("probe gen={gen} id={id} verdict={word}");
+        // Silence that counts as a strike is always written; repeats are
+        // throttled.
+        let strike = silent.is_some() && self.rebuild.is_none() && !holding;
+        if !strike {
+            if let Some(a) = self.probe_line(now, &word, format!("{base} strikes={strikes}")) {
+                out.push(a);
+            }
         }
         if self.rebuild.is_some() {
             return out;
@@ -1639,6 +1805,10 @@ impl Watch {
                 cur.next_probe_at = now + CONFIRM_GAP;
                 (cur.strikes, cur.first_strike_at.unwrap_or(now))
             };
+            if strike {
+                let a = self.note_probe_line(now, &word, format!("{base} strikes={strikes}"));
+                out.push(a);
+            }
             if strikes >= 2 && now.saturating_duration_since(first) >= CONFIRM_GAP {
                 out.extend(self.verdict_dead(now, Trigger::Dead(reason), call_active));
             }
@@ -1661,6 +1831,27 @@ impl Watch {
             return out;
         }
         if now.saturating_duration_since(since) >= UNRESPONSIVE_LIMIT {
+            if agent_seen {
+                // The softphone came up in this page, and its frame runs in a
+                // process of its own: it may still ring and answer while the
+                // page's main frame is blocked (a dialog, a long task). A
+                // rebuild would replace it with a later softphone, expected to
+                // stay stuck. Keep probing.
+                let first_time = match self.cur.as_mut() {
+                    Some(c) => {
+                        let first = !c.agent_logged;
+                        c.agent_logged = true;
+                        first
+                    }
+                    None => false,
+                };
+                if first_time {
+                    out.push(log_action(format!(
+                        "unresponsive gen={gen}: the softphone was up in this page, not rebuilt"
+                    )));
+                }
+                return out;
+            }
             out.extend(self.verdict_dead(now, Trigger::Unresponsive, call_active));
         }
         out
@@ -1670,22 +1861,43 @@ impl Watch {
 
     fn verdict_dead(&mut self, now: Instant, trigger: Trigger, call_active: bool) -> Vec<Action> {
         let mut out = Vec::new();
-        // A flagged call keeps the page unless its death is unambiguous.
+        // A flagged call keeps the page unless its death is unambiguous, or
+        // the hold has lasted longer than such a page could hide a call
+        // (rule 2c: a stale flag must not pin a dead tab forever).
+        let mut expired = false;
         if call_active && !unambiguous(trigger) {
-            if let Some(cur) = self.cur.as_mut() {
-                cur.reset_strikes();
-                cur.next_probe_at = now + WAIT_PROBE;
-                if !cur.hold_logged {
-                    cur.hold_logged = true;
+            let limit = hold_max(trigger);
+            let held = self.cur.as_mut().map(|cur| {
+                let first = cur.held_since.is_none();
+                let since = *cur.held_since.get_or_insert(now);
+                (cur.gen, since, first)
+            });
+            let (gen, since, first) = held.unwrap_or((0, now, true));
+            let held_for = now.saturating_duration_since(since);
+            expired = limit.is_some_and(|l| held_for >= l);
+            if !expired {
+                if let Some(cur) = self.cur.as_mut() {
+                    cur.reset_strikes();
+                    cur.next_probe_at = now + WAIT_PROBE;
+                }
+                if first {
+                    let max = limit.map_or_else(|| "none".to_string(), |l| format!("{}s", l.as_secs()));
                     out.push(log_action(format!(
-                        "held gen={} reason=ambiguous-no-app trigger={} call-flag=1",
-                        cur.gen,
+                        "held gen={gen} reason=call-flag trigger={} max={max}",
                         trigger.word()
                     )));
                 }
+                return out;
             }
-            return out;
+            out.push(log_action(format!(
+                "held expired gen={gen} trigger={} held-for={}s: the call flag counts as stale",
+                trigger.word(),
+                held_for.as_secs()
+            )));
         }
+        // The backoff resets only after a page stayed alive 5 minutes since
+        // THIS death (rule 2d), whatever found it.
+        self.alive_since = None;
         if self.dead_since.is_none() {
             self.dead_since = Some(now);
         }
@@ -1698,13 +1910,14 @@ impl Watch {
             trigger.word(),
             call_active as u8
         )));
-        if trigger.definite() {
+        if unambiguous(trigger) || expired {
             // No live page means no live call in it (rule 2c).
             out.push(Action::ClearStaleCall);
         }
         if let Some(cur) = self.cur.as_mut() {
             cur.reset_strikes();
             cur.no_answer_since = None;
+            cur.held_since = None;
             cur.next_probe_at = now + WAIT_PROBE;
         }
         if self.signout_pending {
@@ -1759,9 +1972,6 @@ impl Watch {
 
     fn arm_restart(&mut self, now: Instant, trigger: Trigger) -> Vec<Action> {
         let mut out = Vec::new();
-        if self.restart.is_some() {
-            return out;
-        }
         let (watched, last_class) = match &self.cur {
             Some(c) => (c.watched, c.last_class),
             None => (false, None),
@@ -1770,7 +1980,37 @@ impl Watch {
             return out;
         }
         let evidence = restart_evidence(trigger, last_class, self.last_online);
-        let min_pending = if matches!(trigger, Trigger::RendererGone(_)) {
+        let renderer = matches!(trigger, Trigger::RendererGone(_));
+        if let Some(r) = self.restart.as_mut() {
+            // Already pending. A later death that points at the engine
+            // upgrades evidence that still waits for the server (a server that
+            // recovered, then rebuilt pages that keep dying in the engine):
+            // otherwise the one cure for an engine fault would never come.
+            if evidence == Evidence::Engine && r.evidence != Evidence::Engine {
+                let was = r.evidence;
+                r.evidence = Evidence::Engine;
+                r.trigger = trigger;
+                if renderer {
+                    // At least a minute from now (a Windows shutdown can end
+                    // the engine before it ends the app).
+                    let need = now.saturating_duration_since(r.armed_at) + RESTART_MIN_PENDING_RENDERER;
+                    if need > r.min_pending {
+                        r.min_pending = need;
+                    }
+                }
+                out.push(log_action(format!(
+                    "restart evidence upgraded from={} to=engine reason={}",
+                    was.word(),
+                    trigger.word()
+                )));
+                if now.saturating_duration_since(r.armed_at) >= r.min_pending {
+                    r.last_check = Some(now);
+                    out.push(Action::TryRestart);
+                }
+            }
+            return out;
+        }
+        let min_pending = if renderer {
             RESTART_MIN_PENDING_RENDERER
         } else {
             Duration::ZERO
@@ -1784,6 +2024,8 @@ impl Watch {
             min_pending,
             last_check: if immediate { Some(now) } else { None },
             last_hold: None,
+            suppressed: 0,
+            offline_at: None,
         });
         out.push(log_action(format!(
             "restart pending reason={} evidence={}",
@@ -1823,8 +2065,11 @@ impl Watch {
         };
         match hold {
             Some(word) => {
-                if let Some(line) = note_hold(r, now, word, "") {
-                    out.push(log_action(line));
+                if let Some(suppressed) = hold_due(r, now, word) {
+                    out.push(Action::RestartHeld {
+                        word: word.to_string(),
+                        suppressed,
+                    });
                 }
             }
             None => out.push(Action::TryRestart),
@@ -1833,10 +2078,28 @@ impl Watch {
     }
 
     /// The shell held a restart (a call, someone at the computer, the
-    /// cooldown, ...): the line to log, at most once per reason per 10 min.
-    pub fn restart_held(&mut self, now: Instant, word: &str, detail: &str) -> Option<String> {
+    /// cooldown, ...): whether to log it (at most once per reason per 10 min),
+    /// and how many hold lines were left out since the last one.
+    pub fn restart_hold_due(&mut self, now: Instant, word: &str) -> Option<u32> {
         let r = self.restart.as_mut()?;
-        note_hold(r, now, word, detail)
+        hold_due(r, now, word)
+    }
+
+    /// The probe of web view `gen`, sent at `sent_at`, saw the softphone's
+    /// agent up. That alone is not "ready": Streams marks the agent arrived
+    /// for a wrong-person sign-in too, which the page then signs out of (the
+    /// softphone after it is a later one in this run, expected stuck). It
+    /// counts only after the same page said "offline" (a break: the agent is
+    /// up; a page that gave up has none).
+    fn agent_ready(&mut self, gen: u64, sent_at: Instant) -> Vec<Action> {
+        let after_offline = self.restart.as_ref().is_some_and(|r| {
+            r.offline_at
+                .is_some_and(|(g, at)| g == gen && at <= sent_at)
+        });
+        if !after_offline {
+            return Vec::new();
+        }
+        self.restart_ready("agent", sent_at)
     }
 
     /// A ready softphone cancels the pending restart, if the signal came after
@@ -1896,8 +2159,10 @@ impl Watch {
         if let Some((id, trigger, stage)) = pending {
             match stage {
                 Stage::Waiting { at } if now >= at => {
-                    if trigger == Trigger::Unresponsive && s.call_active {
-                        // A call started after all.
+                    if s.call_active && trigger != Trigger::PageAsked && !unambiguous(trigger) {
+                        // A call flag came up during the wait, and this is a
+                        // death a live call could survive: no rebuild (the
+                        // probes decide again, the hold rules included).
                         self.rebuild = None;
                         out.push(log_action(format!("rebuild canceled reason=call id={id}")));
                     } else {
@@ -2088,6 +2353,7 @@ impl Watch {
         }
         cur.reset_strikes();
         cur.no_answer_since = None;
+        cur.held_since = None;
         let cancel = match &self.rebuild {
             Some(rb) if matches!(rb.stage, Stage::Waiting { .. }) && rb.trigger != Trigger::PageAsked => {
                 Some(rb.id)
@@ -2101,19 +2367,32 @@ impl Watch {
         out
     }
 
-    /// PHONE_STATE from `label` (available | call | offline | connecting).
-    /// `available` and `call` mean the softphone works: a pending restart is
-    /// canceled. `offline` is either a break (the softphone works) or a page
-    /// that gave up (voice page halt(): stuck), so it only asks for a probe,
-    /// whose `a` field (the agent arrived) tells them apart.
+    /// PHONE_STATE from `label` (available | call | offline | connecting; the
+    /// voice page's shellPhoneState). `available` and `call` mean the
+    /// softphone works: a pending restart is canceled. `offline` is either a
+    /// break or Connect's own state with the softphone up, or a page that gave
+    /// up (voice page halt(): stuck), so it is noted and asks for a probe,
+    /// whose `a` field (the agent is up) tells them apart. A person who chose
+    /// not to take calls is never treated as stuck.
     pub fn on_phone_state(&mut self, now: Instant, label: &str, state: &str) -> Vec<Action> {
         let mut out = Vec::new();
-        if !self.cur.as_ref().is_some_and(|c| c.label == label) {
-            return out;
-        }
+        let gen = match &self.cur {
+            Some(c) if c.label == label => c.gen,
+            _ => return out,
+        };
         match state {
-            "available" | "call" => out.extend(self.restart_ready(state, now)),
+            "available" | "call" => {
+                if let Some(cur) = self.cur.as_mut() {
+                    cur.agent_seen = true;
+                }
+                out.extend(self.restart_ready(state, now));
+            }
             "offline" if self.restart.is_some() => {
+                if let Some(r) = self.restart.as_mut() {
+                    if !r.offline_at.is_some_and(|(g, _)| g == gen) {
+                        r.offline_at = Some((gen, now));
+                    }
+                }
                 if let Some(cur) = self.cur.as_mut() {
                     if cur.probe.is_none() && cur.next_probe_at > now {
                         cur.next_probe_at = now;
@@ -2137,6 +2416,18 @@ impl Watch {
         if self.rebuild.as_ref().is_some_and(|rb| rb.id == id) {
             self.rebuild = None;
             vec![log_action(format!("rebuild canceled reason={why} id={id}"))]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The open step of rebuild `id` ran without creating the always-on tab
+    /// itself (it adopted a tab opened meanwhile, opened an unpinned one, or
+    /// opened none): the ticket ends now, not after OPEN_LOST.
+    pub fn finish_rebuild(&mut self, id: u64, how: &str) -> Vec<Action> {
+        if self.rebuild.as_ref().is_some_and(|rb| rb.id == id) {
+            self.rebuild = None;
+            vec![log_action(format!("rebuild done how={how} id={id}"))]
         } else {
             Vec::new()
         }
@@ -2217,10 +2508,12 @@ mod tests {
         }
     }
 
-    /// The pinned Phone web view "tab-1" (gen 1), created at t0.
+    /// The pinned Phone web view "tab-1" (gen 1), created at t0, its load
+    /// events hooked.
     fn watched(t0: Instant) -> Watch {
         let mut w = Watch::new();
         let _ = w.on_webview_created(t0, "tab-1", 1, true);
+        let _ = w.on_hooks(1, true);
         w
     }
 
@@ -2271,6 +2564,16 @@ mod tests {
 
     fn tries_restart(a: &[Action]) -> bool {
         a.iter().any(|x| matches!(x, Action::TryRestart))
+    }
+
+    /// The restart holds the rules asked the shell to log.
+    fn holds(a: &[Action]) -> Vec<String> {
+        a.iter()
+            .filter_map(|x| match x {
+                Action::RestartHeld { word, .. } => Some(word.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn probes(a: &[Action]) -> Vec<(u64, u64)> {
@@ -2512,6 +2815,10 @@ mod tests {
         assert!(PROBE_JS.contains("__VISTA_ANSWER_CALL"));
         assert!(PROBE_JS.contains("agent.initialized===true"));
         assert!(!PROBE_JS.contains("_next/static"), "a chunk tag is no proof of life");
+        assert!(
+            PROBE_JS.contains(&format!("h==='{PLATFORM_HOST}'")),
+            "the probe's host is the shell's Platform host"
+        );
     }
 
     #[test]
@@ -2610,11 +2917,33 @@ mod tests {
             restart_evidence(Trigger::Dead(DeadReason::NeverLoaded), None, Some(false)),
             Evidence::Network
         );
+        let up = Some(true);
+        for (t, want) in [
+            (Trigger::Dead(DeadReason::ServerError(500)), Evidence::Server),
+            (Trigger::Dead(DeadReason::ErrorPage), Evidence::Network),
+            (Trigger::Dead(DeadReason::Silent(NavClass::Server(502))), Evidence::Server),
+            (Trigger::Dead(DeadReason::Silent(NavClass::BlankAfterFailure)), Evidence::Engine),
+            (Trigger::Dead(DeadReason::Silent(NavClass::Network)), Evidence::Network),
+            (Trigger::Dead(DeadReason::NeverLoaded), Evidence::Engine),
+            (Trigger::Dead(DeadReason::StillLoading), Evidence::Unclear),
+            (Trigger::Dead(DeadReason::NavStalled), Evidence::Unclear),
+            (Trigger::Dead(DeadReason::NoApp(None)), Evidence::Unclear),
+            (Trigger::Missing, Evidence::Unclear),
+            (Trigger::Unresponsive, Evidence::Unclear),
+        ] {
+            assert_eq!(restart_evidence(t, None, up), want, "{t:?}");
+        }
+        assert!(!unambiguous(Trigger::Dead(DeadReason::NavStalled)));
+        assert!(unambiguous(Trigger::Missing));
+        assert!(!unambiguous(Trigger::PageAsked));
+        assert_eq!(hold_max(Trigger::Dead(DeadReason::NoApp(Some(200)))), Some(HOLD_MAX_NO_APP));
+        assert_eq!(hold_max(Trigger::Dead(DeadReason::StillLoading)), Some(HOLD_MAX_NO_APP));
+        assert_eq!(hold_max(Trigger::Dead(DeadReason::NavStalled)), Some(HOLD_MAX_STALLED));
+        assert_eq!(hold_max(Trigger::Unresponsive), None);
         assert!(!Trigger::PageAsked.arms_restart());
         assert!(!Trigger::Unresponsive.arms_restart());
         assert!(!Trigger::Missing.arms_restart());
         assert!(Trigger::Dead(DeadReason::Blank).arms_restart());
-        assert!(!Trigger::Unresponsive.definite() && !Trigger::PageAsked.definite());
     }
 
     #[test]
@@ -3197,7 +3526,7 @@ mod tests {
         let no_app = page("p", false, "complete", Some(200)).to_string();
         let _ = answer(&mut w, secs(t0, 20), &no_app, true);
         let a = answer(&mut w, secs(t0, 30), &no_app, true);
-        assert!(has_log(&a, "held gen=1 reason=ambiguous-no-app"));
+        assert!(has_log(&a, "held gen=1 reason=call-flag trigger=dead:no-app:200 max=180s"));
         assert!(!clears(&a));
         assert!(!has_log(&a, "scheduled"));
         assert!(w.restart.is_none());
@@ -3326,7 +3655,7 @@ mod tests {
         assert!(has_log(&a, "evidence=server"));
         let s = snap(Some(OWNER), Some("tab-1"), true, false);
         let held = w.on_tick(secs(t0, 35), &s);
-        assert!(has_log(&held, "restart held reason=server"));
+        assert_eq!(holds(&held), vec!["server".to_string()]);
         assert!(!tries_restart(&held));
         // The rebuilt page loads: the server answers, and the restart may go.
         let _ = w.on_webview_created(secs(t0, 45), "tab-2", 2, true);
@@ -3346,7 +3675,7 @@ mod tests {
         w.last_online = Some(false);
         let s = snap(Some(OWNER), Some("tab-1"), true, false);
         let a = w.on_tick(secs(t0, 61), &s);
-        assert!(has_log(&a, "restart held reason=network"));
+        assert_eq!(holds(&a), vec!["network".to_string()]);
         assert!(!tries_restart(&a));
     }
 
@@ -3365,12 +3694,17 @@ mod tests {
         let t0 = Instant::now();
         let mut w = loaded(t0);
         let _ = w.on_process_failed(secs(t0, 30), 1, 1, false);
-        assert!(w.restart_held(secs(t0, 100), "active", " idle=12s").is_some());
-        assert!(w.restart_held(secs(t0, 130), "active", " idle=40s").is_none());
-        assert!(w.restart_held(secs(t0, 131), "call", "").is_some());
-        assert!(w.restart_held(secs(t0, 800), "call", "").is_some());
+        assert_eq!(w.restart_hold_due(secs(t0, 100), "active"), Some(0));
+        assert_eq!(w.restart_hold_due(secs(t0, 130), "active"), None);
+        assert_eq!(w.restart_hold_due(secs(t0, 160), "active"), None);
+        assert_eq!(
+            w.restart_hold_due(secs(t0, 161), "call"),
+            Some(2),
+            "the next line says how many were left out"
+        );
+        assert_eq!(w.restart_hold_due(secs(t0, 800), "call"), Some(0));
         let mut idle = Watch::new();
-        assert!(idle.restart_held(t0, "active", "").is_none(), "nothing pending");
+        assert_eq!(idle.restart_hold_due(t0, "active"), None, "nothing pending");
     }
 
     #[test]
@@ -3422,5 +3756,395 @@ mod tests {
         let b = answer(&mut w, secs(t0, 50), &up, false);
         assert!(has_log(&b, "restart canceled reason=ready signal=agent"));
         assert!(w.restart.is_none());
+    }
+
+    // ── Review fixes (v0.3.3 fix-up) ───────────────────────────────
+
+    fn agent_up() -> String {
+        set(page("p", true, "complete", Some(200)), "a", serde_json::Value::Bool(true))
+    }
+
+    #[test]
+    fn backoff_escalates_when_deaths_are_not_probe_answers() {
+        let t0 = Instant::now();
+        let mut w = loaded(t0);
+        let _ = answer(&mut w, secs(t0, 20), &alive(), false);
+        let _ = answer(&mut w, secs(t0, 400), &alive(), false);
+        let a = w.on_process_failed(secs(t0, 500), 1, 1, false);
+        assert!(has_log(&a, "rebuild #1 scheduled in=10s"));
+        let s = snap(Some(OWNER), Some("tab-1"), true, false);
+        assert_eq!(rebuilds(&w.on_tick(secs(t0, 510), &s)), 1);
+        let _ = w.on_webview_created(secs(t0, 512), "tab-2", 2, true);
+        let _ = w.on_hooks(2, true);
+        let b = answer(&mut w, secs(t0, 535), &alive(), false);
+        assert_eq!(w.attempts, 1, "alive for seconds is not stable");
+        assert!(!has_log(&b, "backoff reset"));
+        let c = w.on_process_failed(secs(t0, 560), 2, 1, false);
+        assert!(has_log(&c, "rebuild #2 scheduled in=30s"), "{:?}", logs(&c));
+    }
+
+    #[test]
+    fn late_failure_is_no_sign_of_life() {
+        let t0 = Instant::now();
+        let mut sim = Sim::new(t0, loaded(t0));
+        sim.page = None;
+        let _ = sim.run(5, 40);
+        let (gen, late_id, since) = {
+            let c = sim.w.cur.as_ref().expect("cur");
+            (c.gen, c.late_probe.expect("remembered"), c.no_answer_since)
+        };
+        assert!(since.is_some());
+        let a = sim
+            .w
+            .on_probe_answer(secs(t0, 45), gen, late_id, ProbeOutcome::Failed(-2_147_467_259), false);
+        assert!(has_log(&a, "probe late gen=1") && has_log(&a, "answered=0"));
+        let c = sim.w.cur.as_ref().expect("cur");
+        assert_eq!(c.no_answer_since, since, "a late error proves nothing");
+        assert!(c.late_probe.is_none());
+        // The silence keeps counting from the first timeout.
+        let all = sim.run(45, 185);
+        assert!(has_log(&all, "dead gen=1 reason=unresponsive"));
+    }
+
+    #[test]
+    fn later_navigation_that_never_commits_is_stalled() {
+        let t0 = Instant::now();
+        let mut w = loaded(t0);
+        let _ = answer(&mut w, secs(t0, 20), &alive(), false);
+        let _ = w.on_nav_starting(1, nav_start(2, secs(t0, 100)));
+        let mut sim = Sim::new(t0, w);
+        sim.page = None;
+        let early = sim.run(105, 170);
+        assert!(!has_log(&early, "scheduled"), "under 75 s in flight is still a load");
+        let all = sim.run(175, 230);
+        assert!(has_log(&all, "dead gen=1 reason=dead:nav-stalled call-flag=0"));
+        assert!(has_log(&all, "rebuild #1 scheduled"));
+        assert!(!clears(&all), "the old document may still be there");
+        assert!(!tries_restart(&all), "unclear evidence waits until a page answers");
+        assert!(sim
+            .w
+            .restart
+            .as_ref()
+            .is_some_and(|r| r.evidence == Evidence::Unclear));
+    }
+
+    #[test]
+    fn stalled_navigation_with_a_call_flag_is_held_at_most_fifteen_minutes() {
+        let t0 = Instant::now();
+        let mut w = loaded(t0);
+        let _ = answer(&mut w, secs(t0, 20), &alive(), false);
+        let _ = w.on_nav_starting(1, nav_start(2, secs(t0, 100)));
+        let mut sim = Sim::new(t0, w);
+        sim.page = None;
+        sim.call = true;
+        let held = sim.run(105, 1000);
+        assert!(has_log(
+            &held,
+            "held gen=1 reason=call-flag trigger=dead:nav-stalled max=900s"
+        ));
+        assert!(!clears(&held) && !has_log(&held, "scheduled"));
+        let expired = sim.run(1005, 1200);
+        assert!(has_log(&expired, "held expired gen=1 trigger=dead:nav-stalled"));
+        assert!(clears(&expired));
+        assert!(has_log(&expired, "scheduled"));
+    }
+
+    #[test]
+    fn engine_death_upgrades_a_pending_server_restart() {
+        let t0 = Instant::now();
+        let mut w = loaded(t0);
+        let _ = answer(&mut w, secs(t0, 20), &alb502(), false);
+        let a = answer(&mut w, secs(t0, 30), &alb502(), false);
+        assert!(has_log(&a, "evidence=server"));
+        assert!(!tries_restart(&a));
+        let s = snap(Some(OWNER), Some("tab-1"), true, false);
+        assert_eq!(rebuilds(&w.on_tick(secs(t0, 40), &s)), 1);
+        let _ = w.on_webview_created(secs(t0, 43), "tab-2", 2, true);
+        let _ = w.on_hooks(2, true);
+        let _ = w.on_nav_starting(2, nav_start(5, secs(t0, 43)));
+        let done = NavDone {
+            id: 5,
+            at: secs(t0, 44),
+            ok: false,
+            err: 14,
+            http: Some(0),
+            source: Some(PageKind::Blank),
+        };
+        let _ = w.on_nav_completed(secs(t0, 44), 2, done);
+        let _ = answer(&mut w, secs(t0, 70), &blank(), false);
+        let b = answer(&mut w, secs(t0, 80), &blank(), false);
+        assert!(has_log(
+            &b,
+            "restart evidence upgraded from=server to=engine reason=dead:blank"
+        ));
+        assert!(tries_restart(&b));
+    }
+
+    #[test]
+    fn unpinned_tab_never_takes_the_rebuild_ticket() {
+        let t0 = Instant::now();
+        let mut w = loaded(t0);
+        w.rebuild = Some(test_rebuild(
+            7,
+            Trigger::Dead(DeadReason::Blank),
+            Stage::Closing { since: secs(t0, 10) },
+        ));
+        let a = w.on_webview_created(secs(t0, 11), "tab-2", 2, false);
+        assert!(!has_log(&a, "rebuild opened"));
+        assert!(w.open_step_allowed(7), "the open step still runs, and adopts the tab");
+        let b = w.finish_rebuild(7, "adopted");
+        assert!(has_log(&b, "rebuild done how=adopted id=7"));
+        assert!(w.rebuild.is_none());
+        // A waiting re-create is left to adopt a sidebar tab; the always-on
+        // tab supersedes it.
+        let mut v = loaded(t0);
+        v.rebuild = Some(test_rebuild(8, Trigger::Missing, Stage::Waiting { at: secs(t0, 50) }));
+        let _ = v.on_webview_created(secs(t0, 20), "tab-3", 3, false);
+        assert!(v.rebuild.is_some());
+        let c = v.on_webview_created(secs(t0, 21), "tab-4", 4, true);
+        assert!(has_log(&c, "rebuild superseded id=8 gen=4 trigger=missing"));
+        assert!(v.rebuild.is_none());
+    }
+
+    #[test]
+    fn call_flag_at_fire_time_cancels_an_ambiguous_rebuild() {
+        let t0 = Instant::now();
+        let flagged = snap(Some(OWNER), Some("tab-1"), true, true);
+        let mut w = loaded(t0);
+        w.rebuild = Some(test_rebuild(
+            5,
+            Trigger::Dead(DeadReason::NoApp(Some(200))),
+            Stage::Waiting { at: secs(t0, 40) },
+        ));
+        let a = w.on_tick(secs(t0, 40), &flagged);
+        assert!(has_log(&a, "rebuild canceled reason=call id=5"));
+        assert_eq!(rebuilds(&a), 0);
+        // An unambiguous death goes ahead: the page is gone, the flag is stale.
+        let mut v = loaded(t0);
+        v.rebuild = Some(test_rebuild(
+            6,
+            Trigger::Dead(DeadReason::Blank),
+            Stage::Waiting { at: secs(t0, 40) },
+        ));
+        assert_eq!(rebuilds(&v.on_tick(secs(t0, 40), &flagged)), 1);
+    }
+
+    #[test]
+    fn stale_call_flag_hold_on_a_page_with_no_app_ends() {
+        let t0 = Instant::now();
+        let mut sim = Sim::new(t0, loaded(t0));
+        sim.call = true;
+        sim.page = Some(page("p", false, "complete", Some(200)).to_string());
+        let early = sim.run(5, 205);
+        assert!(has_log(&early, "held gen=1 reason=call-flag"));
+        assert!(!clears(&early) && !has_log(&early, "scheduled"), "not before 3 minutes");
+        let after = sim.run(210, 230);
+        assert!(has_log(&after, "held expired gen=1 trigger=dead:no-app:200"));
+        assert!(clears(&after));
+        assert!(has_log(&after, "rebuild #1 scheduled in=10s"));
+        // The shell cleared the stale flag: the rebuild goes ahead.
+        sim.call = false;
+        assert_eq!(rebuilds(&sim.run(235, 245)), 1);
+    }
+
+    #[test]
+    fn agent_alone_does_not_cancel_the_restart() {
+        let t0 = Instant::now();
+        let mut w = armed(t0);
+        let a = answer(&mut w, secs(t0, 45), &agent_up(), false);
+        assert!(!has_log(&a, "restart canceled"));
+        assert!(w.restart.is_some(), "the agent alone may be a wrong-person arrival");
+        let _ = w.on_phone_state(secs(t0, 50), "tab-1", "offline");
+        let b = answer(&mut w, secs(t0, 51), &agent_up(), false);
+        assert!(has_log(&b, "restart canceled reason=ready signal=agent"));
+        // "offline" from another page generation does not count.
+        let mut v = armed(t0);
+        let _ = v.on_phone_state(secs(t0, 40), "tab-1", "offline");
+        let _ = v.on_webview_created(secs(t0, 42), "tab-2", 2, true);
+        let c = answer(&mut v, secs(t0, 70), &agent_up(), false);
+        assert!(!has_log(&c, "restart canceled"));
+        assert!(v.restart.is_some());
+    }
+
+    #[test]
+    fn silence_without_load_events_never_counts_as_never_loaded() {
+        let t0 = Instant::now();
+        // The hooks failed (silence proves nothing), or no real navigation
+        // start ever arrived.
+        let mut no_hooks = Watch::new();
+        let _ = no_hooks.on_webview_created(t0, "tab-1", 1, true);
+        let _ = no_hooks.on_hooks(1, false);
+        let _ = no_hooks.on_nav_starting(1, nav_start(1, t0));
+        for w in [no_hooks, watched(t0)] {
+            let mut sim = Sim::new(t0, w);
+            sim.page = None;
+            sim.call = true;
+            let all = sim.run(5, 1800);
+            assert!(!clears(&all));
+            assert!(!tries_restart(&all));
+            assert_eq!(rebuilds(&all), 0);
+            assert!(!has_log(&all, "never-loaded"));
+            assert!(has_log(&all, "no answer during a call: waiting"));
+        }
+    }
+
+    #[test]
+    fn canceled_first_load_is_never_loaded_whatever_its_address() {
+        let t0 = Instant::now();
+        let mut w = watched(t0);
+        let _ = w.on_nav_starting(1, nav_start(1, t0));
+        let _ = w.on_nav_completed(secs(t0, 1), 1, nav_done(1, secs(t0, 1), false, 14, Some(0)));
+        let mut sim = Sim::new(t0, w);
+        sim.page = None;
+        let all = sim.run(5, 80);
+        assert!(has_log(&all, "reason=dead:never-loaded"));
+        assert!(tries_restart(&all), "a load cut off before any document is the engine");
+    }
+
+    #[test]
+    fn unresponsive_page_whose_softphone_came_up_is_not_rebuilt() {
+        let t0 = Instant::now();
+        let mut w = loaded(t0);
+        let _ = answer(&mut w, secs(t0, 20), &agent_up(), false);
+        let mut sim = Sim::new(t0, w);
+        sim.page = None;
+        let all = sim.run(25, 900);
+        assert_eq!(rebuilds(&all), 0);
+        assert!(!has_log(&all, "scheduled"));
+        assert!(has_log(&all, "the softphone was up in this page, not rebuilt"));
+        // The same silence where the softphone never came up is rebuilt.
+        let mut sim2 = Sim::new(t0, loaded(t0));
+        sim2.page = None;
+        assert!(has_log(&sim2.run(5, 300), "dead gen=1 reason=unresponsive"));
+    }
+
+    #[test]
+    fn strike_lines_are_always_written() {
+        let t0 = Instant::now();
+        let mut w = loaded(t0);
+        let a1 = answer(&mut w, secs(t0, 20), &alb502(), false);
+        let a2 = answer(&mut w, secs(t0, 30), &alb502(), false);
+        assert!(has_log(&a1, "verdict=dead:no-app:502") && has_log(&a1, "strikes=1"));
+        assert!(
+            has_log(&a2, "verdict=dead:no-app:502") && has_log(&a2, "strikes=2"),
+            "the confirming strike is written too"
+        );
+        let probe_at = logs(&a2).iter().position(|m| m.contains("strikes=2"));
+        let dead_at = logs(&a2).iter().position(|m| m.starts_with("dead gen=1"));
+        assert!(probe_at.is_some() && dead_at.is_some() && probe_at < dead_at);
+    }
+
+    #[test]
+    fn owner_gone_follows_ensure_and_sign_out() {
+        let t0 = Instant::now();
+        let mut w = Watch::new();
+        assert!(w.owner_gone());
+        let _ = w.on_ensure(t0, OWNER, None);
+        assert!(!w.owner_gone(), "a first open that failed can still be retried");
+        let _ = w.on_signed_out(t0);
+        assert!(w.owner_gone());
+    }
+
+    /// An HRESULT is written as 0x........: a code, not a number.
+    fn long_digit_run(s: &str) -> bool {
+        let chars: Vec<char> = s.chars().collect();
+        let (mut i, mut run) = (0, 0);
+        while i < chars.len() {
+            if chars[i] == '0' && chars.get(i + 1) == Some(&'x') {
+                i += 2;
+                while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+                run = 0;
+                continue;
+            }
+            if chars[i].is_ascii_digit() {
+                run += 1;
+                if run >= 5 {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// No log line may carry what the PHI rule forbids: an id, a query
+    /// string, an e-mail address or a long number (counters and durations
+    /// under their own keys aside).
+    fn assert_phi_safe(lines: &[String]) {
+        const NUMERIC_KEYS: [&str; 10] =
+            ["id", "gen", "nav", "ms", "res", "in", "dead-for", "held-for", "strikes", "after"];
+        for line in lines {
+            assert!(!line.contains('@') && !line.contains('?'), "{line}");
+            let chars: Vec<char> = line.chars().collect();
+            let uuid = chars.windows(36).any(|w| {
+                w.iter().enumerate().all(|(i, c)| match i {
+                    8 | 13 | 18 | 23 => *c == '-',
+                    _ => c.is_ascii_hexdigit(),
+                })
+            });
+            assert!(!uuid, "{line}");
+            for token in line.split_whitespace() {
+                let numeric = token
+                    .split_once('=')
+                    .is_some_and(|(key, _)| NUMERIC_KEYS.contains(&key));
+                assert!(numeric || !long_digit_run(token), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn log_lines_are_phi_safe() {
+        let t0 = Instant::now();
+        let client = "9b2e8c1a-0d4f-4e6a-8b7c-1f2e3d4c5b6a";
+        let nasty_path = format!(
+            "/manage/{COMPANY}/clients/{client}/jane.doe@example.com/57155501420?phone=5715550142&name=Jane"
+        );
+        let nasty_url = format!("https://platform.vistainterface.com{nasty_path}");
+        let mut all: Vec<Action> = Vec::new();
+        // A page with an id-laden address that answers, then dies as a 502.
+        let mut w = watched(t0);
+        let mut s = nav_start(1, t0);
+        s.target = log_target(&nasty_url);
+        all.extend(w.on_nav_starting(1, s));
+        all.extend(w.on_nav_completed(secs(t0, 1), 1, nav_done(1, secs(t0, 1), false, 0, Some(502))));
+        let mut sim = Sim::new(t0, w);
+        sim.page = Some(set(
+            page("p", true, "complete", Some(200)),
+            "p",
+            serde_json::json!(nasty_path),
+        ));
+        all.extend(sim.run(5, 100));
+        sim.page = Some(set(
+            page("p", false, "complete", Some(502)),
+            "p",
+            serde_json::json!(nasty_path),
+        ));
+        all.extend(sim.run(105, 500));
+        // A foreign sign-in page, then an error page during a call flag.
+        let mut w2 = watched(t0);
+        let mut s2 = nav_start(9, t0);
+        s2.target = log_target("https://accounts.example.com/signin?email=jane@example.com&code=123456789");
+        all.extend(w2.on_nav_starting(1, s2));
+        let mut sim2 = Sim::new(t0, w2);
+        sim2.page = Some(error_page());
+        sim2.call = true;
+        all.extend(sim2.run(5, 300));
+        // A stalled navigation under a call flag, then silence.
+        let mut w3 = loaded(t0);
+        let mut s3 = nav_start(2, secs(t0, 100));
+        s3.target = log_target(&nasty_url);
+        all.extend(w3.on_nav_starting(1, s3));
+        let mut sim3 = Sim::new(t0, w3);
+        sim3.page = None;
+        sim3.call = true;
+        all.extend(sim3.run(105, 1300));
+        let lines = logs(&all);
+        assert!(lines.len() > 20, "the scenarios log");
+        assert!(lines.iter().any(|l| l.contains("platform:/manage/:id/clients/:id/:x/:n")));
+        assert_phi_safe(&lines);
     }
 }

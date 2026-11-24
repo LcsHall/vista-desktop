@@ -14,16 +14,18 @@
 // page here" answers 10 s apart, a committed error page that stays silent, a
 // load that never arrived, a dead renderer, or no Phone tab at all) is rebuilt
 // for its owner from /manage/<company>/voice, pinned and in the same place,
-// with backoff (10 s, 30 s, 60 s, 2 min, then every 5 min). A live VISTA page
-// of any path is never rebuilt. The rules are in phone_recovery/logic.rs
-// (unit-tested in CI).
+// with backoff (10 s, 30 s, 60 s, 2 min, then every 5 min). A VISTA page that
+// answers is never rebuilt, whatever its path; one that stops answering is
+// rebuilt after 2 minutes only with no call flagged and only if its softphone
+// never came up. The rules are in phone_recovery/logic.rs (unit-tested in CI).
 //
 // Restart (owner decision 2026-11-23, "Only when safe"): only the FIRST
 // softphone of an app run comes up; every later one in the same run stays
 // stuck. So after a dead tab VISTA restarts itself through the v0.3.1 restart
 // path (begin_exit with relaunch), but only with no call and no ring, nobody
-// at the computer for 10 minutes, the server answering, Windows not shutting
-// down, at most once per 30 minutes and 3 times in 6 hours (kept on disk and
+// at the computer for 10 minutes, Windows not shutting down, and, when the
+// failure points at the server or the network, only after a page has answered
+// again; at most once per 30 minutes and 3 times in 6 hours (kept on disk and
 // written BEFORE the restart; a failed write means no restart). Until then the
 // tab is rebuilt and the restart stays pending. A softphone that reports ready
 // cancels it, and so do sign-out and quitting. The relaunched copy reopens the
@@ -44,7 +46,9 @@
 //   restarts happen only from the tick and the handlers posted with `later`,
 //   so no web view is ever created or destroyed inside a WebView2 callback.
 // - Every entry point runs under catch_unwind: a panic here must never take
-//   the app (or a call) down.
+//   the app (or a call) down. Once the exit has begun, a caught panic
+//   finishes the exit instead (a hidden window with EXITING set would ignore
+//   every close).
 
 mod logic;
 
@@ -58,18 +62,21 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Manager, Url};
 
-pub(crate) use self::logic::SENTINEL_PREFIX;
+// One definition of the Platform host, a VISTA id and the sentinel prefix,
+// shared with lib.rs.
+pub(crate) use self::logic::{is_vista_id, PLATFORM_HOST, SENTINEL_PREFIX};
 use self::logic::{
     handoff_json, history_from_read, history_json, normalize_history, parse_handoff,
-    parse_history, restart_decision, utc_stamp, voice_url_for_owner, Action, ContentEvt,
-    HistoryRead, NavDone, NavStart, ProbeOutcome, RestartHold, Snapshot, Trigger, Watch, PERIOD,
-    REBUILD_GAP_MS, RESTART_IDLE_MS, TICK,
+    parse_history, restart_decision, split_owner, unambiguous, utc_stamp, voice_url_for_owner,
+    Action, ContentEvt, HistoryRead, NavDone, NavStart, ProbeOutcome, RestartHold, Snapshot,
+    Trigger, Watch, PERIOD, REBUILD_GAP_MS, RESTART_CAP, RESTART_COOLDOWN_MS, RESTART_IDLE_MS,
+    TICK,
 };
 
 use super::{
     begin_exit, close_login_window, close_phone_tabs, close_tab_impl, ensure_phone_tab,
-    is_voice_url, later, later_after, open_tab_ex, phone_tab_label, refresh_popup,
-    set_call_active, TabState, CALL_ACTIVE, EXITING, PLATFORM_TAB, RINGING,
+    finish_exit, is_voice_url, later, later_after, open_tab_ex, phone_tab_label, refresh_popup,
+    set_call_active, TabState, CALL_ACTIVE, EXITING, EXIT_SENT, PLATFORM_TAB, RINGING,
 };
 
 static WATCH: Mutex<Watch> = Mutex::new(Watch::new());
@@ -87,6 +94,9 @@ static LOG_FILE: Mutex<()> = Mutex::new(());
 /// This copy is restarting itself (for the exit-path note).
 static RESTARTING: AtomicBool = AtomicBool::new(false);
 static EXIT_NOTED: AtomicBool = AtomicBool::new(false);
+/// The app, for the one thing a caught panic must still do once the exit has
+/// begun: leave.
+static APP: OnceLock<Mutex<AppHandle>> = OnceLock::new();
 
 const LOG_FILE_NAME: &str = "phone-tab.log";
 const LOG_MAX_BYTES: u64 = 512 * 1024;
@@ -119,29 +129,61 @@ fn try_with_watch<R>(hook: &str, f: impl FnOnce(&mut Watch) -> R) -> Option<R> {
     Some(f(&mut *guard))
 }
 
-/// Run `f`; a panic is logged (sanitised) and `fallback` returned.
+/// Run `f`; a panic is logged (as a fixed word, never its text) and
+/// `fallback` returned.
 fn guarded<R>(what: &str, fallback: R, f: impl FnOnce() -> R) -> R {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(r) => r,
         Err(payload) => {
-            log(format!("panic where={what} msg={}", panic_text(&*payload)));
+            log(format!("panic where={what} kind={}", panic_kind(&*payload)));
+            leave_if_exiting(what);
             fallback
         }
     }
 }
 
-/// A panic message reduced to letters and a little punctuation (no digits,
-/// so no number can ever reach the log).
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    let raw = payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_default();
-    raw.chars()
-        .filter(|&c| c.is_ascii_alphabetic() || matches!(c, ' ' | ':' | '_' | '.' | '-' | '(' | ')'))
-        .take(80)
-        .collect()
+/// The exit began (EXITING is set) but its last step has not run: run it now,
+/// so a panic can never leave a hidden window that ignores every close.
+fn leave_if_exiting(what: &str) {
+    if !EXITING.load(Ordering::SeqCst) || EXIT_SENT.load(Ordering::SeqCst) {
+        return;
+    }
+    let app = APP
+        .get()
+        .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    if let Some(app) = app {
+        log_sync(format!("panic during exit where={what}: leaving now"));
+        finish_exit(&app);
+    }
+}
+
+/// What kind of panic, as a fixed word: never any text of the payload (it can
+/// carry names, numbers or paths).
+fn panic_kind(payload: &(dyn std::any::Any + Send)) -> &'static str {
+    let text: &str = if let Some(s) = payload.downcast_ref::<&str>() {
+        *s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        ""
+    };
+    if text.contains("char boundary") || text.contains("byte index") {
+        "slice"
+    } else if text.contains("poison") {
+        "poison"
+    } else if text.contains("out of bounds") {
+        "index"
+    } else if text.contains("unwrap") {
+        "unwrap"
+    } else if text.contains("borrow") {
+        "borrow"
+    } else if text.contains("overflow") {
+        "overflow"
+    } else if text.is_empty() {
+        "unknown"
+    } else {
+        "other"
+    }
 }
 
 /// Only the log lines of `actions` (what the hooks may do).
@@ -158,6 +200,7 @@ fn log_only(actions: Vec<Action>) {
 /// Start the watchdog and its log. Called once from the app's setup, after
 /// TabState is managed.
 pub(crate) fn start(app: &AppHandle) {
+    let _ = APP.set(Mutex::new(app.clone()));
     guarded("start", (), || {
         if let Ok(dir) = app.path().app_local_data_dir() {
             let _ = fs::create_dir_all(&dir);
@@ -253,6 +296,9 @@ fn run_actions(app: &AppHandle, actions: Vec<Action>) {
             Action::ClearStaleCall => clear_stale_call(app),
             Action::FinishSignOut => close_phone_tabs(app),
             Action::TryRestart => try_restart(app),
+            Action::RestartHeld { word, suppressed } => {
+                log(held_line(&word, "", suppressed, idle_ms_now()))
+            }
         }
     }
 }
@@ -266,15 +312,39 @@ pub(crate) fn attach(app: &AppHandle, label: &str, pinned: bool) {
         let gen = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
         let now = Instant::now();
         let owned = label.to_string();
-        match try_with_watch("attach", |w| w.on_webview_created(now, label, gen, pinned)) {
+        let created_now =
+            match try_with_watch("attach", |w| w.on_webview_created(now, label, gen, pinned)) {
+                Some(actions) => {
+                    log_only(actions);
+                    true
+                }
+                None => {
+                    later(app, move |_app| {
+                        let actions =
+                            with_watch(|w| w.on_webview_created(now, &owned, gen, pinned));
+                        log_only(actions);
+                    });
+                    false
+                }
+            };
+        #[cfg(windows)]
+        let hooks_ok = attach_com(app, label, gen);
+        #[cfg(not(windows))]
+        let hooks_ok = false;
+        // Whether silence can mean "never loaded" here: reported after the
+        // creation, in the same order (`later` is FIFO).
+        let reported = if created_now {
+            try_with_watch("hooks", |w| w.on_hooks(gen, hooks_ok))
+        } else {
+            None
+        };
+        match reported {
             Some(actions) => log_only(actions),
             None => later(app, move |_app| {
-                let actions = with_watch(|w| w.on_webview_created(now, &owned, gen, pinned));
+                let actions = with_watch(|w| w.on_hooks(gen, hooks_ok));
                 log_only(actions);
             }),
         }
-        #[cfg(windows)]
-        attach_com(app, label, gen);
     });
 }
 
@@ -283,9 +353,9 @@ pub(crate) fn attach(app: &AppHandle, label: &str, pinned: bool) {
 /// throws the details away). They fire on the UI thread, only read their
 /// arguments and queue work; they live as long as the web view (as the mic
 /// handler does). If one fails to register, the periodic probe still covers
-/// the tab.
+/// the tab. Returns whether the three load-event handlers registered.
 #[cfg(windows)]
-fn attach_com(app: &AppHandle, label: &str, gen: u64) {
+fn attach_com(app: &AppHandle, label: &str, gen: u64) -> bool {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2NavigationCompletedEventArgs2, COREWEBVIEW2_PROCESS_FAILED_KIND,
         COREWEBVIEW2_WEB_ERROR_STATUS,
@@ -298,12 +368,13 @@ fn attach_com(app: &AppHandle, label: &str, gen: u64) {
 
     let Some(webview) = app.get_webview(label) else {
         log(format!("attach gen={gen} tab={label} no-webview"));
-        return;
+        return false;
     };
     let app_start = app.clone();
     let app_content = app.clone();
     let app_done = app.clone();
     let app_fail = app.clone();
+    let (tx, rx) = mpsc::channel::<bool>();
     let result = webview.with_webview(move |platform_webview| {
         // SAFETY: WebView2 COM calls on the UI thread with_webview runs us on
         // (inline: open_tab_ex runs on the main thread). The handlers fire on
@@ -317,10 +388,13 @@ fn attach_com(app: &AppHandle, label: &str, gen: u64) {
                         "attach gen={gen} core-failed hr={:#010x}",
                         e.code().0 as u32
                     ));
+                    let _ = tx.send(false);
                     return;
                 }
             };
             let mut token = 0i64;
+            // The three load events silence is judged by.
+            let mut loads_hooked = true;
 
             let on_start =
                 NavigationStartingEventHandler::create(Box::new(move |_sender, args| {
@@ -354,6 +428,7 @@ fn attach_com(app: &AppHandle, label: &str, gen: u64) {
                     "attach gen={gen} nav-start-hook-failed hr={:#010x}",
                     e.code().0 as u32
                 ));
+                loads_hooked = false;
             }
 
             // A document committed; IsErrorPage = Chromium's own error page
@@ -381,6 +456,7 @@ fn attach_com(app: &AppHandle, label: &str, gen: u64) {
                     "attach gen={gen} content-hook-failed hr={:#010x}",
                     e.code().0 as u32
                 ));
+                loads_hooked = false;
             }
 
             // A second NavigationCompleted handler: wry's own throws the
@@ -430,6 +506,7 @@ fn attach_com(app: &AppHandle, label: &str, gen: u64) {
                     "attach gen={gen} nav-done-hook-failed hr={:#010x}",
                     e.code().0 as u32
                 ));
+                loads_hooked = false;
             }
 
             let on_fail = ProcessFailedEventHandler::create(Box::new(move |_sender, args| {
@@ -448,11 +525,17 @@ fn attach_com(app: &AppHandle, label: &str, gen: u64) {
                     e.code().0 as u32
                 ));
             }
+            let _ = tx.send(loads_hooked);
         }
     });
     if let Err(e) = result {
         log(format!("attach gen={gen} with_webview-failed {e}"));
+        return false;
     }
+    // with_webview ran us inline on the main thread (lib.rs watch_engine_exit
+    // relies on the same). Never block waiting: a queued closure would need
+    // this very thread.
+    rx.try_recv().unwrap_or(false)
 }
 
 /// The WebView2 runtime version, once per launch (whether HttpStatusCode and
@@ -642,16 +725,25 @@ pub(crate) fn page_state(from: &str, state: &str) {
     });
 }
 
-/// The page's own reconnect sentinel (reconnect_voice), on the main thread:
+/// The page's own reconnect sentinel (reconnect_voice, `from` = the tab that
+/// sent it), on the main thread: only from the Phone tab itself (the bridge
+/// script runs in every tab and frame, and this force-closes the Phone tab),
 /// one rebuild in flight at a time, none for a person who signed out.
-pub(crate) fn page_asked_reconnect(app: &AppHandle) {
+pub(crate) fn page_asked_reconnect(app: &AppHandle, from: &str) {
     guarded("page-reconnect", (), || {
         if EXITING.load(Ordering::SeqCst) {
             return;
         }
-        if phone_tab_label(app).is_none() {
-            log("page reconnect: no Phone tab");
-            return;
+        match phone_tab_label(app) {
+            None => {
+                log("page reconnect: no Phone tab");
+                return;
+            }
+            Some(phone) if phone != from => {
+                log("page reconnect ignored: not the Phone tab");
+                return;
+            }
+            Some(_) => {}
         }
         let now = Instant::now();
         let (ticket, actions) = with_watch(|w| w.on_page_reconnect(now));
@@ -668,6 +760,12 @@ pub(crate) fn note_exit(how: &str) {
     if RESTARTING.load(Ordering::SeqCst) && !EXIT_NOTED.swap(true, Ordering::SeqCst) {
         log_sync(format!("restart exit path={how}"));
     }
+}
+
+/// This copy is restarting itself on its own (lib.rs close_all_then_exit then
+/// waits longer for the old engine to exit).
+pub(crate) fn restarting() -> bool {
+    RESTARTING.load(Ordering::SeqCst)
 }
 
 // ─── The rebuild ─────────────────────────────────────────────────────
@@ -690,36 +788,73 @@ fn run_rebuild(app: &AppHandle, id: u64, trigger: Trigger) {
             .is_some_and(|l| s.pinned.iter().any(|p| p == l));
         (label, was_active, pinned, s.phone_owner.clone())
     };
-    // A call live in the Platform tab (on the Phone page itself, lib.rs
-    // 1111-1114) keeps its flag, and closing a Phone tab would clear it.
-    if CALL_ACTIVE.load(Ordering::SeqCst) && platform_on_phone_page(app) {
-        let actions = with_watch(|w| w.cancel_rebuild(id, "platform-tab-on-phone-page"));
+    let label_live = label
+        .as_deref()
+        .is_some_and(|l| app.get_webview(l).is_some());
+    let call = CALL_ACTIVE.load(Ordering::SeqCst);
+    let page_asked = trigger == Trigger::PageAsked;
+    let why = if call && platform_on_phone_page(app) {
+        // A call live in the Platform tab (on the Phone page itself, lib.rs
+        // 1111-1114) keeps its flag, and closing a Phone tab would clear it.
+        Some("platform-tab-on-phone-page")
+    } else if call && !page_asked && !unambiguous(trigger) {
+        // A death a live call could survive is never rebuilt while a call is
+        // flagged (the page's own reconnect says no call is live in it).
+        Some("call")
+    } else if !page_asked && label_live && !pinned && trigger != Trigger::Missing {
+        // The watchdog only ever rebuilds the always-on tab.
+        Some("not-pinned")
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        let actions = with_watch(|w| w.cancel_rebuild(id, why));
         run_actions(app, actions);
         return;
     }
     let wanted = with_watch(|w| w.wanted());
-    let pin_owner = if pinned || label.is_none() {
+    let pin_owner = if pinned || label.is_none() || !page_asked {
         wanted.or(owner)
     } else {
         None
     };
     let url: Option<Url> = match &pin_owner {
         Some(owner) => voice_url_for_owner(owner).and_then(|u| u.parse::<Url>().ok()),
-        // A page-asked rebuild of an unpinned Phone tab: as before (its URL).
+        // A page-asked rebuild of an unpinned Phone tab: as before (its
+        // address), but only while that is still the Phone page (a load that
+        // never arrived reports about:blank: rule 2a).
         None => label
             .as_deref()
             .and_then(|l| app.get_webview(l))
-            .and_then(|wv| wv.url().ok()),
+            .and_then(|wv| wv.url().ok())
+            .filter(is_voice_url),
     };
     let Some(url) = url else {
         let actions = with_watch(|w| w.cancel_rebuild(id, "no-url"));
         run_actions(app, actions);
         return;
     };
+    let gen = with_watch(|w| w.cur_gen()).map_or_else(|| "-".to_string(), |g| g.to_string());
+    let background = !was_active;
+    // "Missing", but a Phone tab was opened from the sidebar during the wait:
+    // it is never closed (it may carry a call); the open step adopts it.
+    let adopt = trigger == Trigger::Missing && label_live;
+    log(format!(
+        "rebuild start id={id} gen={gen} trigger={} tab={} active={} pinned={} adopt={}",
+        trigger.word(),
+        label.as_deref().unwrap_or("none"),
+        was_active as u8,
+        pin_owner.is_some() as u8,
+        adopt as u8
+    ));
+    if adopt {
+        open_step(app, id, url, background, pin_owner);
+        return;
+    }
     // A stalled sign-in window belongs to the app, not the tab (as the page's
     // own reconnect does).
     close_login_window(app);
-    if trigger.definite() {
+    if unambiguous(trigger) {
         clear_stale_call(app);
     }
     if let Some(l) = &label {
@@ -727,14 +862,6 @@ fn run_rebuild(app: &AppHandle, id: u64, trigger: Trigger) {
         // the call flag and the ring (close_tab_impl).
         close_tab_impl(app, l, true);
     }
-    log(format!(
-        "rebuild start id={id} trigger={} tab={} active={} pinned={}",
-        trigger.word(),
-        label.as_deref().unwrap_or("none"),
-        was_active as u8,
-        pin_owner.is_some() as u8
-    ));
-    let background = !was_active;
     let gap = if label.is_some() { REBUILD_GAP_MS } else { 0 };
     later_after(app, gap, move |app| {
         open_step(app, id, url, background, pin_owner)
@@ -747,15 +874,19 @@ fn open_step(app: &AppHandle, id: u64, url: Url, background: bool, pin_owner: Op
         if EXITING.load(Ordering::SeqCst) {
             return;
         }
-        let signed_in = pin_owner.is_none() || {
+        let has_owner = {
             let state = app.state::<Mutex<TabState>>();
             let s = state.lock().unwrap_or_else(|e| e.into_inner());
             s.phone_owner.is_some()
         };
-        let allowed = with_watch(|w| w.open_step_allowed(id));
+        let (allowed, owner_gone) = with_watch(|w| (w.open_step_allowed(id), w.owner_gone()));
+        // A sign-out ends the ticket itself (on_signed_out, go_idle). This
+        // second check also asks the watchdog, so a first open that failed
+        // (phone_owner never set) is still retried.
+        let signed_out = pin_owner.is_some() && owner_gone && !has_owner;
         let why = if !allowed {
             Some("superseded")
-        } else if !signed_in {
+        } else if signed_out {
             Some("signed-out")
         } else {
             None
@@ -765,11 +896,44 @@ fn open_step(app: &AppHandle, id: u64, url: Url, background: bool, pin_owner: Op
             run_actions(app, actions);
             return;
         }
-        // attach → on_webview_created marks the rebuild opened. If open_tab_ex
-        // deduped onto an existing tab or add_child failed, the rebuild
-        // expires after 30 s and the "missing" path takes over.
+        // A Phone tab opened from the sidebar meanwhile (unpinned): open_tab_ex
+        // adopts it (dedupe, then pinned), but only one on this owner's spa;
+        // it is never closed (it may carry a call).
+        let before = phone_tab_label(app).filter(|l| app.get_webview(l).is_some());
+        if let (Some(owner), Some(existing)) = (pin_owner.as_deref(), before.as_deref()) {
+            if !tab_on_owner_spa(app, existing, owner) {
+                let actions = with_watch(|w| w.finish_rebuild(id, "tab-appeared"));
+                run_actions(app, actions);
+                return;
+            }
+        }
         open_tab_ex(app, url, background, pin_owner);
+        // attach → on_webview_created ended the ticket if the always-on tab
+        // was created. Otherwise it adopted a tab, opened an unpinned one, or
+        // opened none (add_child failed; the "missing" path takes over): the
+        // ticket ends now.
+        if with_watch(|w| w.open_step_allowed(id)) {
+            let after = phone_tab_label(app);
+            let how = match (&before, &after) {
+                (_, None) => "not-opened",
+                (Some(b), Some(a)) if b == a => "adopted",
+                _ => "opened-unwatched",
+            };
+            let actions = with_watch(|w| w.finish_rebuild(id, how));
+            run_actions(app, actions);
+        }
     });
+}
+
+/// The tab `label` shows a page of `owner`'s spa (/manage/<company>/...).
+fn tab_on_owner_spa(app: &AppHandle, label: &str, owner: &str) -> bool {
+    let Some((company, _)) = split_owner(owner) else {
+        return false;
+    };
+    let prefix = format!("/manage/{}/", company.to_ascii_lowercase());
+    app.get_webview(label)
+        .and_then(|wv| wv.url().ok())
+        .is_some_and(|u| u.path().to_ascii_lowercase().starts_with(&prefix))
 }
 
 /// No live page is left in the Phone tab, so no call can be live in it: clear
@@ -820,25 +984,26 @@ fn try_restart(app: &AppHandle) {
     if EXITING.load(Ordering::SeqCst) {
         return; // the person is already quitting: never turn that into a relaunch
     }
+    // Read first: every decision line carries it.
+    let idle = idle_ms_now();
     let ringing = RINGING.lock().map(|r| r.is_some()).unwrap_or(true);
     if CALL_ACTIVE.load(Ordering::SeqCst) || ringing {
-        restart_held(now, "call", String::new());
+        restart_held(now, "call", "", idle);
         return;
     }
-    let idle = idle_ms_now();
     match idle {
         Some(ms) if ms >= RESTART_IDLE_MS => {}
-        Some(ms) => {
-            restart_held(now, "active", format!(" idle={}s", ms / 1000));
+        Some(_) => {
+            restart_held(now, "active", "", idle);
             return;
         }
         None => {
-            restart_held(now, "idle-unknown", String::new());
+            restart_held(now, "idle-unknown", "", idle);
             return;
         }
     }
     if shutting_down() {
-        restart_held(now, "shutdown", String::new());
+        restart_held(now, "shutdown", "", idle);
         return;
     }
     // The cooldown and the cap, kept on disk: written and read back before
@@ -846,8 +1011,8 @@ fn try_restart(app: &AppHandle) {
     let now_ms = unix_ms();
     let count = match record_restart(now_ms) {
         Ok(count) => count,
-        Err((word, detail)) => {
-            restart_held(now, word, detail);
+        Err((word, extra)) => {
+            restart_held(now, word, &extra, idle);
             return;
         }
     };
@@ -867,14 +1032,59 @@ fn try_restart(app: &AppHandle) {
     ));
     RESTARTING.store(true, Ordering::SeqCst);
     // The v0.3.1 restart: the softphone ends in-page, every web view closes,
-    // the engine exits, then a fresh copy starts (the sign-in is kept).
-    begin_exit(app, true);
+    // the engine exits, then a fresh copy starts (the sign-in is kept). It
+    // sets EXITING first, so if it panics part-way, leave anyway (and
+    // relaunch): a hidden window with EXITING set ignores every close.
+    if catch_unwind(AssertUnwindSafe(|| begin_exit(app, true))).is_err() {
+        log_sync("restart: begin_exit failed part-way, leaving now");
+        finish_exit(app);
+    }
 }
 
-fn restart_held(now: Instant, word: &str, detail: String) {
-    let line = with_watch(|w| w.restart_held(now, word, &detail));
-    if let Some(line) = line {
-        log(line);
+/// A restart held (a call, someone at the computer, the cooldown, ...):
+/// logged at most once per reason per 10 minutes, with the idle time and the
+/// cooldown state.
+fn restart_held(now: Instant, word: &str, extra: &str, idle: Option<u32>) {
+    if let Some(suppressed) = with_watch(|w| w.restart_hold_due(now, word)) {
+        log(held_line(word, extra, suppressed, idle));
+    }
+}
+
+/// "restart held reason=<word><extra> idle=<s> restarts-6h=<n> since-last=<s>
+/// [repeats-suppressed=<n>]": every restart decision says why, how long
+/// nobody has touched the computer, and where the cooldown and the cap stand.
+fn held_line(word: &str, extra: &str, suppressed: u32, idle: Option<u32>) -> String {
+    let rep = if suppressed > 0 {
+        format!(" repeats-suppressed={suppressed}")
+    } else {
+        String::new()
+    };
+    format!("restart held reason={word}{extra}{}{rep}", restart_state(idle))
+}
+
+/// " idle=<s|unknown> restarts-6h=<n> since-last=<s|->", from the restart
+/// record read the way the cooldown and the cap read it (never written here).
+fn restart_state(idle: Option<u32>) -> String {
+    let idle = idle.map_or_else(|| "unknown".to_string(), |ms| format!("{}s", ms / 1000));
+    let now_ms = unix_ms();
+    let (raw, _) = history_from_read(&read_history(), now_ms);
+    let (list, _) = normalize_history(&raw, now_ms);
+    let since = list.iter().max().map_or_else(
+        || "-".to_string(),
+        |&t| format!("{}s", now_ms.saturating_sub(t) / 1000),
+    );
+    format!(" idle={idle} restarts-6h={} since-last={since}", list.len())
+}
+
+/// The restart record as it is on disk.
+fn read_history() -> HistoryRead {
+    let Some(path) = data_file(RESTARTS_FILE) else {
+        return HistoryRead::Missing;
+    };
+    match fs::read_to_string(path) {
+        Ok(text) => HistoryRead::Text(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HistoryRead::Missing,
+        Err(_) => HistoryRead::Unreadable,
     }
 }
 
@@ -884,12 +1094,7 @@ fn record_restart(now_ms: u64) -> Result<usize, (&'static str, String)> {
     let Some(path) = data_file(RESTARTS_FILE) else {
         return Err(("record", " step=no-folder".to_string()));
     };
-    let read = match fs::read_to_string(&path) {
-        Ok(text) => HistoryRead::Text(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HistoryRead::Missing,
-        Err(_) => HistoryRead::Unreadable,
-    };
-    let (raw, broken) = history_from_read(&read, now_ms);
+    let (raw, broken) = history_from_read(&read_history(), now_ms);
     let (list, changed) = normalize_history(&raw, now_ms);
     match restart_decision(&list, now_ms) {
         Ok(next) => {
@@ -912,11 +1117,16 @@ fn record_restart(now_ms: u64) -> Result<usize, (&'static str, String)> {
             if broken {
                 return Err(("record-reset", String::new()));
             }
+            // (The line also gets restarts-6h and since-last: restart_state.)
             Err(match hold {
-                RestartHold::Cooldown { since_last_s } => {
-                    ("cooldown", format!(" since-last={since_last_s}s"))
-                }
-                RestartHold::Cap { count } => ("cap", format!(" restarts-6h={count}")),
+                RestartHold::Cooldown { since_last_s } => (
+                    "cooldown",
+                    format!(
+                        " cooldown-left={}s",
+                        (RESTART_COOLDOWN_MS / 1000).saturating_sub(since_last_s)
+                    ),
+                ),
+                RestartHold::Cap { count } => ("cap", format!(" cap={count}/{RESTART_CAP}")),
             })
         }
     }

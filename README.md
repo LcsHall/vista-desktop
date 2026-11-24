@@ -219,15 +219,20 @@ was restarted. `src-tauri/src/phone_recovery.rs` is the shell's safety net:
 
 - It reads every Phone web view's own load events (status code, error,
   error page, renderer exit) and asks the tab every minute, with a tiny
-  read-only script, whether a VISTA page is actually running in it. A live
-  VISTA page of any path is never touched.
+  read-only script, whether a VISTA page is actually running in it. A VISTA
+  page that answers is never touched, whatever its path. One that stops
+  answering is rebuilt after 2 minutes only with no call flagged, and only
+  if its softphone never came up.
 - A tab confirmed dead is rebuilt for its owner from
   `/manage/<company>/voice` (pinned, same place), backing off 10 s, 30 s,
-  60 s, 2 min, then every 5 min. Never while a call may be live in it.
+  60 s, 2 min, then every 5 min. Never while a call may be live in it (a
+  call flag on a page with no app in it counts as stale after 3 minutes, or
+  15 for a navigation that never commits).
 - Only the first softphone of an app run comes up, so after a dead tab the
   app restarts itself (the 0.3.1 restart path), but only when it is safe: no
-  call, nobody at the computer for 10 minutes, the server answering, at most
-  once per 30 minutes and 3 times in 6 hours (`phone-restarts.json`). A
+  call, nobody at the computer for 10 minutes, and, when the failure points
+  at the server or the network, only after a page has answered again; at
+  most once per 30 minutes and 3 times in 6 hours (`phone-restarts.json`). A
   softphone that reports ready cancels it, and so do sign-out and quitting.
 - No UI. The log, with path templates only (no addresses, ids or names), is
   `%LOCALAPPDATA%\com.vistainterface.platform\phone-tab.log`.
