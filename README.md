@@ -248,19 +248,35 @@ was restarted. `src-tauri/src/phone_recovery.rs` is the shell's safety net:
 The rules are unit-tested (`cargo test --test phone_recovery_logic` in
 `src-tauri`); the CI test build runs them before the release build.
 
-## Updates wait for a moment with no call (0.3.4)
+## Updates never close VISTA during a call (0.3.4)
 
 Install on the "Update available" box used to close VISTA at once (on
 Windows the updater starts the installer and ends the app), cutting off a live
-call. Since 0.3.4 Install downloads the update first (VISTA keeps working),
-then waits until no call is live or ringing (the automatic restart's own
-test, checked about once a second), and only then hands over to the
-installer. Quitting meanwhile drops it; the box comes back at the next
-launch. The box itself (wording, buttons) is unchanged. The install that runs
-is always the installed version's own code, so the update TO 0.3.4 still
+call. Since 0.3.4 Install downloads the update first (VISTA keeps working).
+If no call is live or ringing when the download finishes, it hands over to
+the installer at once, as the person asked. If one is, the install no longer
+happens the moment the call ends (that could close a POS or checkout screen
+still waiting on the card reader, leaving a charged card on an unpaid sale,
+and would drop whatever was typed during the call). It waits instead for the
+automatic restart's own safety test: no call and no ring, nobody at the
+computer for 10 minutes (an hour while any VISTA tab or window is on the POS
+or an appointment checkout), Windows not shutting down. Then it hands the
+Phone tab to the copy the installer starts (the restart's hand-off file,
+honoured for two minutes), so the Phone tab reopens even behind the idle
+lock. Only the per-user install (the `setup.exe`, NSIS `currentUser`) waits
+like that, because it never asks Windows for admin rights; a copy installed
+from the `.msi` (per-machine, a UAC prompt nobody would answer) drops the
+update instead. Quitting meanwhile drops it too; the box comes back at the
+next launch. The box itself (wording, buttons) is unchanged. The install that
+runs is always the installed version's own code, so the update TO 0.3.4 still
 closes at once; updates after it are the first ones that wait. Log lines:
-`update downloaded: install waits for no call or ring`,
-`update install now waited=<s>s`, `update install dropped reason=quit`.
+`update install now waited=0s` (no call),
+`update install dropped reason=call installer=<msi|other|unknown>`,
+`update install waiting reason=call`,
+`update install held reason=<call|active|payment-page|idle-unknown|shutdown> idle=<s>s`
+(at most once per reason per 10 minutes),
+`update install now waited=<s>s idle=<s>s handoff=<0|1>`,
+`update install dropped reason=quit`, `update install failed`.
 
 ## Things to think about before the Store submission
 

@@ -1,5 +1,6 @@
 //! Phone-tab self-recovery: the pure decision rules (v0.3.3; the payment-screen
-//! guard on the automatic restart, v0.3.4).
+//! guard on the automatic restart, and the same safety test for an update
+//! install that had to wait for a call, v0.3.4).
 //!
 //! Plain data in, decisions out. No Tauri, no WebView2, no files and no clock
 //! of its own (every function is handed `now`), so all of it runs under
@@ -105,6 +106,17 @@ pub const RESTART_MIN_PENDING_RENDERER: Duration = Duration::from_secs(60);
 pub const HOLD_LOG_EVERY: Duration = Duration::from_secs(600);
 /// The restart hand-off is honoured only this soon after it was written.
 pub const HANDOFF_MAX_AGE_MS: u64 = 120_000;
+
+// An update install that had to wait for a call (v0.3.4, phone_recovery.rs
+// wait_for_install_moment): it waits for the restart's own safety test.
+
+/// How often a waiting install looks at the call flags and at quitting.
+pub const INSTALL_POLL: Duration = Duration::from_secs(1);
+/// With no call and no ring, how often it asks the main thread for the test.
+pub const INSTALL_CHECK_EVERY: Duration = Duration::from_secs(30);
+/// The longest wait for that answer (a busy main thread): then it asks again
+/// at the next check.
+pub const INSTALL_ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The shell's own sentinel URLs (lib.rs: the close, call and phone bridges).
 pub const SENTINEL_PREFIX: &str = "https://vista-desktop.invalid/";
@@ -844,6 +856,75 @@ pub fn idle_hold(idle: Option<u32>, payment_open: bool) -> Option<&'static str> 
         Some(_) if payment_open => Some("payment-page"),
         Some(_) => Some("active"),
     }
+}
+
+/// The automatic restart's whole safety test, in its order. None: VISTA may
+/// close now. Otherwise the hold word: `call` (a call live or ringing), then
+/// idle_hold's (`idle-unknown`, `payment-page`, `active`), then `shutdown`
+/// (Windows shutting down or signing out). The restart and an update install
+/// that had to wait for a call both use it (v0.3.4), so an update never closes
+/// VISTA at a moment the restart could not. `payment_open` is asked only when
+/// it can matter (no call, idle known and under an hour), `shutting_down` only
+/// once everything else passed.
+pub fn safety_hold(
+    call_or_ringing: bool,
+    idle: Option<u32>,
+    payment_open: impl FnOnce() -> bool,
+    shutting_down: impl FnOnce() -> bool,
+) -> Option<&'static str> {
+    if call_or_ringing {
+        return Some("call");
+    }
+    let payment = idle.is_some_and(|ms| ms < RESTART_IDLE_PAYMENT_MS) && payment_open();
+    if let Some(word) = idle_hold(idle, payment) {
+        return Some(word);
+    }
+    if shutting_down() {
+        return Some("shutdown");
+    }
+    None
+}
+
+/// The hold lines of an update install waiting for a safe moment: like the
+/// restart's (hold_due), at most once per reason per 10 minutes, counting the
+/// lines left out.
+#[derive(Debug, Default)]
+pub struct HoldLog {
+    last: Option<(&'static str, Instant)>,
+    suppressed: u32,
+}
+
+impl HoldLog {
+    pub fn new() -> HoldLog {
+        HoldLog::default()
+    }
+
+    /// Some(n): write the line for `word` now (n lines were left out since the
+    /// last one). None: leave it out.
+    pub fn due(&mut self, now: Instant, word: &'static str) -> Option<u32> {
+        let due = match self.last {
+            Some((w, t)) => w != word || now.saturating_duration_since(t) >= HOLD_LOG_EVERY,
+            None => true,
+        };
+        if !due {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.last = Some((word, now));
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+/// "update install held reason=<word> idle=<s|unknown>
+/// [repeats-suppressed=<n>]": why a waiting install still waits.
+pub fn install_held_line(word: &str, suppressed: u32, idle: Option<u32>) -> String {
+    let idle = idle.map_or_else(|| "unknown".to_string(), |ms| format!("{}s", ms / 1000));
+    let rep = if suppressed > 0 {
+        format!(" repeats-suppressed={suppressed}")
+    } else {
+        String::new()
+    };
+    format!("update install held reason={word} idle={idle}{rep}")
 }
 
 // ─── The restart record (persisted) and the hand-off ─────────────────
@@ -3131,6 +3212,105 @@ mod tests {
         assert_eq!(w.restart_hold_due(secs(t0, 160), "active"), Some(1));
         assert_eq!(w.restart_hold_due(secs(t0, 190), "payment-page"), Some(0));
         assert_eq!(w.restart_hold_due(secs(t0, 790), "payment-page"), Some(0));
+    }
+
+    #[test]
+    fn the_safety_test_keeps_its_order_and_asks_only_what_can_matter() {
+        use std::cell::Cell;
+        let payment_asked = Cell::new(0u32);
+        let shutdown_asked = Cell::new(0u32);
+        let check = |call: bool, idle: Option<u32>, payment: bool, shutdown: bool| {
+            safety_hold(
+                call,
+                idle,
+                || {
+                    payment_asked.set(payment_asked.get() + 1);
+                    payment
+                },
+                || {
+                    shutdown_asked.set(shutdown_asked.get() + 1);
+                    shutdown
+                },
+            )
+        };
+        let ten = RESTART_IDLE_MS;
+        let hour = RESTART_IDLE_PAYMENT_MS;
+        // A call or a ring holds first, whatever else is true, and nothing
+        // else is asked: no web view is looked at during a call.
+        assert_eq!(check(true, Some(u32::MAX), false, false), Some("call"));
+        assert_eq!(check(true, None, true, true), Some("call"));
+        assert_eq!((payment_asked.get(), shutdown_asked.get()), (0, 0));
+        // Idle unknown counts as someone at the computer; nothing more asked.
+        assert_eq!(check(false, None, true, true), Some("idle-unknown"));
+        assert_eq!((payment_asked.get(), shutdown_asked.get()), (0, 0));
+        // Then the idle step: the payment screens are asked under an hour idle.
+        assert_eq!(check(false, Some(0), false, false), Some("active"));
+        assert_eq!(check(false, Some(0), true, false), Some("payment-page"));
+        assert_eq!(check(false, Some(ten - 1), false, true), Some("active"));
+        assert_eq!(check(false, Some(ten), true, false), Some("payment-page"));
+        assert_eq!(check(false, Some(hour - 1), true, true), Some("payment-page"));
+        assert_eq!(payment_asked.get(), 5);
+        assert_eq!(shutdown_asked.get(), 0, "shutdown is asked only once the rest passed");
+        // An hour idle: the payment screens no longer matter, so they are not
+        // looked at.
+        assert_eq!(check(false, Some(hour), true, false), None);
+        assert_eq!(check(false, Some(u32::MAX), true, false), None);
+        assert_eq!(payment_asked.get(), 5);
+        assert_eq!(shutdown_asked.get(), 2);
+        // Then Windows shutting down.
+        assert_eq!(check(false, Some(ten), false, true), Some("shutdown"));
+        assert_eq!(check(false, Some(hour), true, true), Some("shutdown"));
+        assert_eq!(check(false, Some(ten), false, false), None);
+        assert_eq!(payment_asked.get(), 7);
+        assert_eq!(shutdown_asked.get(), 5);
+        // Between the call and the shutdown steps it is exactly idle_hold, so
+        // a payment screen still only ever postpones.
+        for ms in [0, 1, ten - 1, ten, ten + 1, hour - 1, hour, u32::MAX] {
+            for payment in [false, true] {
+                assert_eq!(
+                    check(false, Some(ms), payment, false),
+                    idle_hold(Some(ms), payment && ms < hour),
+                    "{ms} {payment}"
+                );
+            }
+            let without = check(false, Some(ms), false, false);
+            let with = check(false, Some(ms), true, false);
+            assert!(without.is_none() || with.is_some(), "{ms}");
+        }
+    }
+
+    #[test]
+    fn a_waiting_install_logs_its_holds_like_the_restart() {
+        // At most once per reason per 10 minutes; a different reason at once,
+        // with the count of the lines left out.
+        let t0 = Instant::now();
+        let mut h = HoldLog::new();
+        assert_eq!(h.due(t0, "active"), Some(0));
+        assert_eq!(h.due(secs(t0, 30), "active"), None);
+        assert_eq!(h.due(secs(t0, 60), "active"), None);
+        assert_eq!(h.due(secs(t0, 90), "payment-page"), Some(2));
+        assert_eq!(h.due(secs(t0, 120), "payment-page"), None);
+        assert_eq!(h.due(secs(t0, 689), "payment-page"), None);
+        assert_eq!(h.due(secs(t0, 690), "payment-page"), Some(2));
+        assert_eq!(h.due(secs(t0, 700), "payment-page"), None);
+        let lines = vec![
+            install_held_line("payment-page", 0, Some(754_321)),
+            install_held_line("idle-unknown", 3, None),
+            install_held_line("call", 0, Some(0)),
+        ];
+        assert_eq!(lines[0], "update install held reason=payment-page idle=754s");
+        assert_eq!(
+            lines[1],
+            "update install held reason=idle-unknown idle=unknown repeats-suppressed=3"
+        );
+        assert_eq!(lines[2], "update install held reason=call idle=0s");
+        assert_phi_safe(&lines);
+        // Once it may go, it goes within one check: the checks are far more
+        // frequent than the 10 idle minutes, and an answer never takes longer
+        // than the gap between two checks.
+        assert!(INSTALL_POLL <= INSTALL_ANSWER_TIMEOUT);
+        assert!(INSTALL_ANSWER_TIMEOUT < INSTALL_CHECK_EVERY);
+        assert!(INSTALL_CHECK_EVERY.as_millis() * 10 <= u128::from(RESTART_IDLE_MS));
     }
 
     #[test]

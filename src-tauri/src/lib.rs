@@ -933,9 +933,9 @@ static CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RINGING: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 
 /// A call is live or ringing on this computer right now (a poisoned ring lock
-/// counts as ringing). The Phone-tab recovery's automatic restart
-/// (phone_recovery::try_restart) and an update's install (spawn_update_check)
-/// both wait until this is false.
+/// counts as ringing). The first step of the safety test that the Phone-tab
+/// recovery's automatic restart and an update's install both wait on
+/// (phone_recovery::safety_hold_now, wait_for_install_moment).
 fn call_or_ringing() -> bool {
     let ringing = RINGING.lock().map(|r| r.is_some()).unwrap_or(true);
     CALL_ACTIVE.load(Ordering::SeqCst) || ringing
@@ -1493,12 +1493,13 @@ fn restart_allowed(app: &AppHandle, from: &str, token: &str) -> bool {
 // ─── Auto-update ────────────────────────────────────────────────────────
 
 /// Check the GitHub Releases feed once at startup; on a newer signed build,
-/// offer Install/Later. Install downloads, waits for a moment with no call
-/// and no ring (v0.3.4), applies, and restarts. Failure paths are
-/// deliberately silent — offline launches and 404s (no release yet) must
-/// never bother a medspa mid-checkin. Same pattern as the vista-admin
-/// cockpit, where it's verified end to end. The box itself (wording and
-/// buttons) is unchanged.
+/// offer Install/Later. Install downloads, applies, and restarts: at once when
+/// no call is live or ringing as the download finishes; otherwise at the next
+/// moment the automatic restart itself would be allowed (v0.3.4,
+/// phone_recovery::wait_for_install_moment). Failure paths are deliberately
+/// silent — offline launches and 404s (no release yet) must never bother a
+/// medspa mid-checkin. Same pattern as the vista-admin cockpit, where it's
+/// verified end to end. The box itself (wording and buttons) is unchanged.
 fn spawn_update_check(app: &tauri::AppHandle) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
     use tauri_plugin_updater::UpdaterExt;
@@ -1535,22 +1536,22 @@ fn spawn_update_check(app: &tauri::AppHandle) {
                         return;
                     };
                     // Installing ends VISTA at once, which would cut a live
-                    // call off (v0.3.4). So wait for a moment with no call and
-                    // no ring, on a thread of its own: the wait can last a
-                    // whole call and must never hold a worker thread of the
-                    // async runtime.
+                    // call off. So with a call or a ring at this point the
+                    // install waits for the automatic restart's own safety
+                    // test (v0.3.4: no call, 10 idle minutes, an hour while a
+                    // POS or checkout is open, no Windows shutdown; per-user
+                    // NSIS installs only), on a thread of its own: the wait
+                    // can last hours and must never hold a worker thread of
+                    // the async runtime.
                     std::thread::spawn(move || {
-                        let Some(waited) = wait_for_no_call() else {
-                            // The app began quitting first (the person, or the
-                            // automatic restart): the box comes back at the
-                            // next launch.
-                            phone_recovery::log("update install dropped reason=quit");
+                        if !phone_recovery::wait_for_install_moment(&restart_handle) {
+                            // Dropped: the app began quitting first (the
+                            // person, or the automatic restart), or this
+                            // install could not wait unattended (an MSI
+                            // install asks for admin rights). The box comes
+                            // back at the next launch.
                             return;
-                        };
-                        phone_recovery::log_sync(format!(
-                            "update install now waited={}s",
-                            waited.as_secs()
-                        ));
+                        }
                         // On Windows the installer takes over: install()
                         // launches it and ends this process itself (so the
                         // single-instance lock goes with it) and the installer
@@ -1561,37 +1562,12 @@ fn spawn_update_check(app: &tauri::AppHandle) {
                         if update.install(bytes).is_ok() {
                             restart_handle.request_restart();
                         } else {
-                            phone_recovery::log("update install failed");
+                            phone_recovery::install_failed();
                         }
                     });
                 });
             });
     });
-}
-
-/// How often a downloaded update looks for a moment with no call.
-const UPDATE_WAIT_POLL: Duration = Duration::from_secs(1);
-
-/// Block the calling plain thread (never the async runtime's) until no call is
-/// live or ringing (call_or_ringing, the automatic restart's own test),
-/// checking about once a second, and say how long that took. None when the
-/// app began quitting first (EXITING).
-fn wait_for_no_call() -> Option<Duration> {
-    let started = std::time::Instant::now();
-    let mut noted = false;
-    loop {
-        if EXITING.load(Ordering::SeqCst) {
-            return None;
-        }
-        if !call_or_ringing() {
-            return Some(started.elapsed());
-        }
-        if !noted {
-            noted = true;
-            phone_recovery::log("update downloaded: install waits for no call or ring");
-        }
-        std::thread::sleep(UPDATE_WAIT_POLL);
-    }
 }
 
 // ─── Tab management ─────────────────────────────────────────────────

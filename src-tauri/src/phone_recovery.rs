@@ -33,6 +33,16 @@
 // cancels it, and so do sign-out and quitting. The relaunched copy reopens the
 // Phone tab from a one-shot hand-off file, even behind the server's idle lock.
 //
+// The same safety test gates an update's install that had to wait for a call
+// (v0.3.4, wait_for_install_moment): Install pressed during a call, or a ring
+// during the download, no longer installs the moment the call ends (that
+// could close a POS or checkout still waiting on the card reader, and drop
+// what was typed during the call) but at the next moment the restart itself
+// would be allowed, with the same hand-off (per-user NSIS installs only; an
+// MSI install, which asks for admin rights, drops it until the next launch).
+// An install with no call when its download finishes still starts at once,
+// as the person asked.
+//
 // Nothing visible is added (the restart's own close-and-reopen aside). Log:
 // %LOCALAPPDATA%\com.vistainterface.platform\phone-tab.log (512 KiB plus one
 // older file): path templates, kind words, status codes, error names,
@@ -68,11 +78,12 @@ use tauri::{AppHandle, Manager, Url};
 // shared with lib.rs.
 pub(crate) use self::logic::{is_vista_id, PLATFORM_HOST, SENTINEL_PREFIX};
 use self::logic::{
-    handoff_json, history_from_read, history_json, idle_hold, is_payment_path, normalize_history,
-    parse_handoff, parse_history, restart_decision, split_owner, unambiguous, utc_stamp,
-    voice_url_for_owner, Action, ContentEvt, HistoryRead, NavDone, NavStart, ProbeOutcome,
-    RestartHold, Snapshot, Trigger, Watch, PERIOD, REBUILD_GAP_MS, RESTART_CAP,
-    RESTART_COOLDOWN_MS, RESTART_IDLE_PAYMENT_MS, TICK,
+    handoff_json, history_from_read, history_json, install_held_line, is_payment_path,
+    normalize_history, parse_handoff, parse_history, restart_decision, safety_hold, split_owner,
+    unambiguous, utc_stamp, voice_url_for_owner, Action, ContentEvt, HistoryRead, HoldLog, NavDone,
+    NavStart, ProbeOutcome, RestartHold, Snapshot, Trigger, Watch, INSTALL_ANSWER_TIMEOUT,
+    INSTALL_CHECK_EVERY, INSTALL_POLL, PERIOD, REBUILD_GAP_MS, RESTART_CAP, RESTART_COOLDOWN_MS,
+    TICK,
 };
 
 use super::{
@@ -987,6 +998,29 @@ fn payment_page_open(app: &AppHandle) -> bool {
 
 // ─── The restart ("Only when safe") ──────────────────────────────────
 
+/// The automatic restart's safety test, right now (logic::safety_hold): no
+/// call and no ring (a poisoned ring lock counts as ringing: lib.rs
+/// call_or_ringing); nobody at the computer for 10 minutes, or for an hour
+/// while any VISTA web view is on a screen that can start a card-reader charge
+/// (v0.3.4: closing it mid-charge would leave a charged card on an unpaid
+/// sale; the web views are looked at only when it can matter, and the hold
+/// word is "payment-page"); Windows not shutting down. None: safe. The restart
+/// (try_restart) and an update install that had to wait (install_check) both
+/// use it. Main thread.
+fn safety_hold_now(app: &AppHandle, idle: Option<u32>) -> Option<&'static str> {
+    safety_hold(call_or_ringing(), idle, || payment_page_open(app), shutting_down)
+}
+
+/// Whose Phone tab a restart (or an update's install) hands to the next copy:
+/// the person the watchdog keeps it for, else the pinned tab's owner.
+fn phone_owner(app: &AppHandle) -> Option<String> {
+    with_watch(|w| w.wanted()).or_else(|| {
+        let state = app.state::<Mutex<TabState>>();
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.phone_owner.clone()
+    })
+}
+
 /// Restart now if it is safe; otherwise log why not (throttled) and let the
 /// tick ask again. Every check and begin_exit run in this one main-thread
 /// turn, so nothing can change in between.
@@ -1000,24 +1034,11 @@ fn try_restart(app: &AppHandle) {
     }
     // Read first: every decision line carries it.
     let idle = idle_ms_now();
-    // A call or a ring (a poisoned ring lock counts as ringing): the same test
-    // an update's install waits on (lib.rs call_or_ringing).
-    if call_or_ringing() {
-        restart_held(now, "call", "", idle);
-        return;
-    }
-    // Nobody at the computer for 10 minutes, or for an hour while any VISTA
-    // web view is on a screen that can start a card-reader charge (v0.3.4):
-    // closing it mid-charge would leave a charged card on an unpaid sale. It
-    // only ever postpones. The web views are looked at only when it can
-    // matter (under an hour idle); the hold line says "payment-page".
-    let payment = idle.is_some_and(|ms| ms < RESTART_IDLE_PAYMENT_MS) && payment_page_open(app);
-    if let Some(word) = idle_hold(idle, payment) {
+    // No call and no ring, nobody at the computer for 10 minutes (an hour
+    // while a payment screen is open), Windows not shutting down: the test an
+    // update's install that had to wait uses too (safety_hold_now).
+    if let Some(word) = safety_hold_now(app, idle) {
         restart_held(now, word, "", idle);
-        return;
-    }
-    if shutting_down() {
-        restart_held(now, "shutdown", "", idle);
         return;
     }
     // The cooldown and the cap, kept on disk: written and read back before
@@ -1030,12 +1051,7 @@ fn try_restart(app: &AppHandle) {
             return;
         }
     };
-    let owner = with_watch(|w| w.wanted()).or_else(|| {
-        let state = app.state::<Mutex<TabState>>();
-        let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        s.phone_owner.clone()
-    });
-    if let Some(owner) = owner {
+    if let Some(owner) = phone_owner(app) {
         if let Err(e) = write_handoff(&owner, now_ms) {
             log_sync(format!("handoff write failed kind={:?}", e.kind()));
         }
@@ -1220,6 +1236,154 @@ fn shutting_down() -> bool {
 #[cfg(not(windows))]
 fn shutting_down() -> bool {
     false
+}
+
+// ─── An update's install (v0.3.4) ────────────────────────────────────
+
+/// What the safety test said, on the main thread, for a waiting install.
+enum InstallCheck {
+    /// Install now, handing the Phone tab to this person (if any).
+    Go(Option<String>, Option<u32>),
+    /// Keep waiting: the hold word, and the idle time for its line.
+    Hold(&'static str, Option<u32>),
+}
+
+/// The automatic restart's safety test for an update install that had to
+/// wait (safety_hold_now), with whose Phone tab to hand over when it passes.
+/// Main thread: it reads the web views' addresses. Posted with `later` by
+/// wait_for_install_moment, never run inside a WebView2 callback.
+fn install_check(app: &AppHandle) -> InstallCheck {
+    guarded("install-check", InstallCheck::Hold("check-failed", None), || {
+        if EXITING.load(Ordering::SeqCst) {
+            return InstallCheck::Hold("quit", None);
+        }
+        let idle = idle_ms_now();
+        match safety_hold_now(app, idle) {
+            Some(word) => InstallCheck::Hold(word, idle),
+            None => InstallCheck::Go(phone_owner(app), idle),
+        }
+    })
+}
+
+/// Which installer this copy of the app came from (tauri-cli patches the
+/// bundle type into each installer's copy of the exe).
+fn installer_word() -> &'static str {
+    use tauri::utils::{config::BundleType, platform::bundle_type};
+    match bundle_type() {
+        Some(BundleType::Nsis) => "nsis",
+        Some(BundleType::Msi) => "msi",
+        Some(_) => "other",
+        None => "unknown",
+    }
+}
+
+/// Block the calling plain thread (never the main thread, never a worker of
+/// the async runtime) until a downloaded update may install (lib.rs
+/// spawn_update_check). true: install now (the line saying so is already in
+/// the log). false: dropped (logged too), and the box comes back at the next
+/// launch: the app began quitting first, or the install would have had to run
+/// unattended from an installer that asks for admin rights.
+///
+/// No call and no ring when the download finished: at once, as the person
+/// just asked ("Install and restart now?"). Otherwise the install would come
+/// at a moment nobody chose (pre-release check M1): closing VISTA the second
+/// the call ends could close a POS or an appointment checkout still waiting on
+/// the card reader (the tap charges the card, capture automatic, but only that
+/// page records the sale) and would drop what was typed during the call. So
+/// it waits for the automatic restart's own safety test: no call and no ring,
+/// nobody at the computer for 10 minutes (an hour while a payment screen is
+/// open), Windows not shutting down. The test reads web view addresses, so it
+/// runs on the main thread (install_check); this thread only waits for the
+/// answer, looks at the call flags once more, and hands the Phone tab to the
+/// copy the installer starts (as the restart does), so it reopens even behind
+/// the server's idle lock.
+///
+/// Waiting means installing with nobody at the computer, which only the
+/// per-user NSIS install (bundle installMode currentUser) can do: it never
+/// asks Windows for admin rights. An MSI install is per-machine and would sit
+/// on a UAC prompt nobody answers, with VISTA already closed, so any other
+/// installer drops the update instead of waiting.
+pub(crate) fn wait_for_install_moment(app: &AppHandle) -> bool {
+    let started = Instant::now();
+    if EXITING.load(Ordering::SeqCst) {
+        log("update install dropped reason=quit");
+        return false;
+    }
+    if !call_or_ringing() {
+        log_sync("update install now waited=0s");
+        return true;
+    }
+    let installer = installer_word();
+    if installer != "nsis" {
+        log(format!("update install dropped reason=call installer={installer}"));
+        return false;
+    }
+    log("update install waiting reason=call");
+    let mut last_check: Option<Instant> = None;
+    let mut holds = HoldLog::new();
+    loop {
+        std::thread::sleep(INSTALL_POLL);
+        if EXITING.load(Ordering::SeqCst) {
+            log("update install dropped reason=quit");
+            return false;
+        }
+        // During a call or a ring the main thread is never asked.
+        if call_or_ringing() || last_check.is_some_and(|t| t.elapsed() < INSTALL_CHECK_EVERY) {
+            continue;
+        }
+        last_check = Some(Instant::now());
+        let (tx, rx) = mpsc::channel::<InstallCheck>();
+        later(app, move |app| {
+            let _ = tx.send(install_check(app));
+        });
+        match rx.recv_timeout(INSTALL_ANSWER_TIMEOUT) {
+            Ok(InstallCheck::Go(owner, idle)) => {
+                // Safe in that main-thread turn. The flags once more, right
+                // before the installer takes over (a ring may have just come).
+                if EXITING.load(Ordering::SeqCst) {
+                    log("update install dropped reason=quit");
+                    return false;
+                }
+                if call_or_ringing() {
+                    continue;
+                }
+                let handoff = match owner {
+                    Some(owner) => match write_handoff(&owner, unix_ms()) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log_sync(format!("handoff write failed kind={:?}", e.kind()));
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                log_sync(format!(
+                    "update install now waited={}s idle={}s handoff={}",
+                    started.elapsed().as_secs(),
+                    idle.unwrap_or(0) / 1000,
+                    handoff as u8
+                ));
+                return true;
+            }
+            Ok(InstallCheck::Hold(word, idle)) => {
+                if let Some(suppressed) = holds.due(Instant::now(), word) {
+                    log(install_held_line(word, suppressed, idle));
+                }
+            }
+            // No answer in time (a busy main thread): ask again at the next
+            // check.
+            Err(_) => {}
+        }
+    }
+}
+
+/// update.install failed (lib.rs): VISTA keeps running, so a hand-off written
+/// for it is withdrawn.
+pub(crate) fn install_failed() {
+    log("update install failed");
+    if let Some(path) = data_file(HANDOFF_FILE) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 // ─── The log (phone-tab.log; nothing personal, ever) ─────────────────
